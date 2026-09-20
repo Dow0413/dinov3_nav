@@ -98,23 +98,25 @@ output/20260920_153045/frame_000001_ground.png
 优先靠近行进方向"。前方被堵时侧向 gate 自动胜出（= 在可通行区域内向
 左/右搜索新的安全方向）。每帧重规划（~6-10Hz）。
 
-**控制律**：`angular.z = -k_angular · waypoint 角度`（列按 hfov 换算）；
+**控制律**：将图像 waypoint 转成 `base_link` 方位后，
+`angular.z = k_angular · waypoint_base_angle`；
 `linear = cruise_linear · 按 waypoint 距离在 stop_depth/full_speed_depth
 之间线性过渡`。无合格 waypoint、覆盖率过低或 watchdog 超时 → 零速；
 节点退出前也发一次零速。
 
 ## 面向全局目标的局部避障
 
-节点订阅 `nav_msgs/Odometry` 的 `/odometry` 与 `geometry_msgs/PoseStamped` 的
-`/goal_pose`。二者必须使用同一个世界坐标系（通常为 `odom`）：节点用当前
-位置/航向将全局目标转成 base_link 方位角，再在每帧已连通的可通行图像区域
+节点订阅 `nav_msgs/Odometry` 的 `/Odometry`（Galileo Gazebo；实机可在参数中
+改为 `/odometry`）与 `geometry_msgs/PoseStamped` 的
+`/goal_pose`。目标可使用 `map`（RViz 默认）或 `odom`；frame 不同时节点通过
+TF 将目标转到 odometry 坐标系。节点用当前位置/航向将全局目标转成 base_link 方位角，再在每帧已连通的可通行图像区域
 中，按“更远 + 与目标方位更一致 + 不贴边”选择 waypoint。
 
 障碍物会先从局部候选中移除；因此目标方向不通时，最优点会落在仍可通行的
 侧向区域，实现边绕障边向目标推进。局部点偏角超过
 `control.turn_in_place_angle_deg` 时机器人只转不前进。进入
-`global.goal_tolerance` 范围、没有 goal/odom、状态超时，或两个话题 frame_id
-不一致时，节点输出零速度。
+`global.goal_tolerance` 范围、没有 goal/odom、odometry 超时，或所需 TF 不存在
+时，节点输出零速度。
 
 上车前建议：先 `control.enabled: false` 用 overlay 核对安全区域质量
 （绿=允许、深绿=被深度扣除的地面、红=近障碍、黄圈=waypoint），再把
