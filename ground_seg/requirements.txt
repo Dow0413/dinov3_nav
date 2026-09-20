@@ -1,0 +1,11 @@
+# torch/torchvision must come from the CUDA 128 index (RTX 5060 Ti / sm_120 needs torch >= 2.7):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+numpy
+opencv-python-headless
+pillow
+scikit-learn
+matplotlib
+# Door & stairs detection (CLIP heads; optional at runtime, both auto degrade without it).
+# Install AFTER torch so pip's resolver keeps the pinned cu128 build untouched.
+# Weights auto-download from openaipublic.azureedge.net (NOT huggingface.co).
+open_clip_torch
