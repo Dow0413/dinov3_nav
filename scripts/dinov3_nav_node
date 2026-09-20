@@ -1,0 +1,48 @@
+#!/home/dow/DOW/dinov3/.venv/bin/python
+# -*- coding: utf-8 -*-
+"""dinov3_nav 节点启动器（本体在 dinov3_nav/node.py）。
+
+节点必须用仓库 .venv 的解释器跑：torch cu128 / ground_seg 的依赖都在 venv 里，
+系统 python3 没有；rclpy 则反过来在 /opt/ros 里，下面按需补进 sys.path。
+
+    cd /home/dow/DOW/dinov3/dinov3_nav_ws
+    source /opt/ros/jazzy/setup.bash
+    colcon build --packages-select dinov3_nav && source install/setup.bash
+    ros2 launch dinov3_nav dinov3_nav.launch.py     # 或 ros2 run dinov3_nav dinov3_nav_node
+
+也可不经 colcon 直接执行本文件（--ros-args 用法同 ros2 run）。
+路径默认值均可用环境变量覆盖：
+    DINOV3_ROOT      ground_seg 核心算法包所在仓库根（默认 /home/dow/DOW/dinov3）
+    DINOV3_NAV_SRC   本包源码目录（默认 <ws>/src/dinov3_nav，模块与 output/ 都以它为锚）
+"""
+
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(os.environ.get("DINOV3_ROOT", "/home/dow/DOW/dinov3"))
+NAV_SRC = Path(os.environ.get(
+    "DINOV3_NAV_SRC", "/home/dow/DOW/dinov3/dinov3_nav_ws/src/dinov3_nav"))
+
+# 1) dinov3_nav（节点模块）与 ground_seg（核心算法包）都从源码树导入：
+#    colcon 安装后脚本落在 install/ 下，绝对路径是唯一可靠来源——与
+#    ground_seg/features.py 里硬编码 DINOV3_REPO 的约定一致。
+#    （节点模块始终从源码树加载，node.py 里的 __file__ 也就稳定指向源码，
+#    output/ 输出目录默认锚定在包目录下。）
+for p in (str(NAV_SRC), str(REPO_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+# 2) rclpy：venv 不含 ROS 包。已 source 的环境经 PYTHONPATH 可见；
+#    否则按 ROS_DISTRO 显式补路径（LD_LIBRARY_PATH 仍需 source 设置，
+#    完全没 source 时 import 会给出明确报错）。
+try:
+    import rclpy  # noqa: F401
+except ImportError:
+    distro = os.environ.get("ROS_DISTRO", "jazzy")
+    sys.path.append(f"/opt/ros/{distro}/lib/python3.12/site-packages")
+
+from dinov3_nav.node import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,91 @@
+# dinov3_nav 参数——话题、模型、深度安全、控制增益都在这里改。
+# launch 文件会把本文件整体传给节点；键名与 dinov3_nav/node.py 的声明一一对应。
+
+dinov3_nav:
+  ros__parameters:
+    # ================= 话题 =================
+    image_topic: /zed/zed_node/rgb/image_rect_color   # ZED 校正后左目 RGB 图
+    depth_topic: /zed/zed_node/depth/depth_registered # 32FC1 米，与 RGB 像素对齐
+    cmd_vel_topic: /cmd_vel                           # 底盘速度指令 (Twist)
+    odom_topic: /odometry                             # nav_msgs/Odometry：当前位置/航向
+    goal_pose_topic: /goal_pose                       # geometry_msgs/PoseStamped：全局目标点
+    # 输出话题（绝对名，避免与其他包冲突）：
+    ground_mask_topic: /dinov3_nav/ground_mask          # Image mono8：SAM2 精修后的地面掩码
+    traversable_mask_topic: /dinov3_nav/traversable_mask  # Image mono8：地面（+楼梯，见下）
+    safe_mask_topic: /dinov3_nav/safe_mask              # Image mono8：最终允许区域（融合后）
+    obstacle_mask_topic: /dinov3_nav/obstacle_mask      # Image mono8：近距障碍观测
+    overlay_topic: /dinov3_nav/overlay                  # Image rgb8：叠加调试图（绿安全区/红障碍/黄圈 waypoint）
+    coverage_topic: /dinov3_nav/coverage                # Float32：地面覆盖率 0..1
+    publish_overlay: true                   # overlay 编码有开销，跑实车可关
+
+    # ================= 机器人 / 相机几何 =================
+    robot.width: 0.40        # 当前阶段未使用；后续启用机身净空时使用
+    robot.hfov: 90.0         # 相机水平视场角(度)，ZED 左目约 90~110；列→角度、米→像素换算都用它
+    camera.yaw_offset_deg: 0.0 # 相机光轴相对 base_link 前方的偏航；左为正
+
+    # ================= 深度安全 =================
+    depth.enable: true            # false = 不订深度，退化成纯 RGB（Gazebo 无深度时用）
+    depth.safe_distance: 1.0      # m，上部行里比这近的物体判为障碍
+    depth.inflation: 0.0          # 当前阶段未使用；后续启用机身净空时的额外安全边距
+    depth.bottom_exempt_frac: 0.35  # 底部 35% 行不判近障碍——前视相机近处地面本身深度就小
+    depth.min_valid: 0.20         # m，小于它的深度通常是相机盲区/噪声；不作为地面或走廊依据
+    depth.sync_slop: 0.05         # RGB/深度时间戳最大允许偏差 s
+
+    # ================= 模型（与 ground_seg/main.py 同一套参数）=================
+    ckpt: /home/dow/DOW/dinov3/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+    # 更快的小模型：.../dinov3_vits16_pretrain_lvd1689m-08c60483.pth（快 2.8 倍）
+    resolution: 448          # 推理分辨率；896 边缘略细但慢一倍
+    device: auto             # auto / cuda / cpu
+    seed_rows_frac: 0.10     # 底部种子行占比（前视相机先验）
+    seed_cols_frac: 0.60     # 种子列居中占比
+    threshold: otsu          # 'otsu'，或固定余弦阈值（写成字符串 "0.55"）
+
+    # ================= SAM2 边界精修 =================
+    sam2.enable: true
+    sam2.ckpt: /home/dow/DOW/dinov3/third_party/sam2/checkpoints/sam2.1_hiera_tiny.pt
+
+    # ================= 楼梯候选头（DINO patch 行突变，默认关）=================
+    # 与 main.py 一致默认关闭：无标注 DINO 特征不能可靠给出楼梯语义，仅调试用。
+    stairs.enable: false
+    stairs.threshold: 0.45
+    stairs.min_area: 0.008
+    stairs.max_area: 0.35    # 过滤道路/整面栅格等覆盖半幅以上的结构误报
+    stairs.min_risers: 3
+    stairs.treat_traversable: true  # true=楼梯并入可通行（机器人能爬梯）；false=仅地面
+
+    # ================= 输出 =================
+    output.enable: true      # 每次启动按时间标签新建文件夹，保存推理的叠加图
+    output.dir: ""           # 空 = <包目录>/output/（每次启动一个 <时间戳>/ 子文件夹）
+    output.save_every: 1     # 每处理几帧存一张 *_ground.png（1=全存；磁盘吃紧时调大）
+
+    # ================= 运行节奏 =================
+    # 目标 10Hz 推理。ViT-B/448 实测每帧 0.15~0.2s（约 5~6Hz，推理绑定）；
+    # 要跑满 10Hz 把上面 ckpt 换成 ViT-S（快 2.8 倍）。
+    process_period: 0.1      # 两次推理的最小间隔（秒）
+
+    # ================= 控制律（waypoint 跟踪）=================
+    # 每帧在"最终允许区域"（地面 ∩ 底部连通 ∩ 深度无近障碍）里自底向上找
+    # 水平连续段 gate，段宽必须 ≥ 该处深度换算的安全走廊像素宽（防卡缝）；
+    # 按「行高(远) + 居中偏好」打分取最优段的中心当局部 waypoint——
+    # 前方被堵时侧向 gate 自动胜出，即"在可通行区域内向左/右搜索"。
+    # 转向对准 waypoint，速度按它的距离在 stop/full 之间线性过渡。
+    control.enabled: true    # false 时不创建 cmd_vel 发布器（纯感知/手动遥控）
+    control.cruise_linear: 0.6  # m/s 巡航前进速度（demo 建议 0.2~0.3 起步）
+    control.max_angular: 0.8     # rad/s 最大转向角速度
+    control.k_angular: 1.2       # waypoint 角度(rad) → 转向角速度增益
+    control.center_weight: 0.3   # gate 打分的居中偏好（行高权重为 1.0；越大越不爱贴边绕）
+    control.stop_depth: 0.5      # waypoint 距离低于此 → 停（前方贴脸）
+    control.full_speed_depth: 2.0  # waypoint 距离高于此 → 全速（之间线性过渡）
+    control.min_coverage: 0.03   # 允许区域覆盖率低于此 → 零速
+    control.cmd_rate: 10.0       # cmd_vel 发布频率 Hz
+    control.watchdog: 1.5        # 超过该秒数没有新分割结果 → 零速
+    control.turn_in_place_angle_deg: 35.0 # 局部点偏航超过此角度只转不前进
+
+    # ================= 全局目标引导 =================
+    # /goal_pose 与 /odometry.header.frame_id 必须同一坐标系（通常都是 odom）。
+    # frame_id 不一致时节点会停车并报错，不会把 map 坐标误当作 odom 坐标使用。
+    global.enable: true
+    global.goal_tolerance: 0.35  # m，距目标以内停止并记录 goal_reached
+    global.goal_weight: 1.2      # 局部点朝向全局目标的偏好；越大越积极回到目标方向
+    global.forward_weight: 1.0   # 局部点越远的偏好
+    global.state_timeout: 1.0    # s，odom 或 goal 超时即停车

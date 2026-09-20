@@ -1,0 +1,143 @@
+#!/home/dow/DOW/dinov3/.venv/bin/python
+# -*- coding: utf-8 -*-
+"""把静态图片 + 合成深度循环发布成相机话题（没有 ZED / 实车时的联调工具）。
+
+    ros2 run dinov3_nav image_replay test_images/galileo_test_2.jpg
+    ros2 run dinov3_nav image_replay img.jpg /camera/image 2.0
+    # 在画面中部注入一个 0.3m 近距障碍矩形，测避障转向：
+    ros2 run dinov3_nav image_replay img.jpg --obs x0,y0,x1,y1 [--obs ...]
+
+用法：image_replay <图片路径> [RGB 话题，默认 ZED] [频率 Hz，默认 5]
+                  [--depth-topic 名] [--obs x0,y0,x1,y1 ...]
+
+深度是合成的"地面斜坡"：底行 0.5m 线性变到顶行 6m（32FC1 米，与 RGB 同
+时间戳同尺寸），--obs 矩形内覆盖为 0.3m 近距值。RGB/深度同名成对发布
+（深度话题默认把 RGB 话题里的 .../rgb/... 换成 .../depth/depth_registered）。
+"""
+
+import os
+import sys
+from array import array
+
+try:
+    import rclpy  # noqa: F401
+except ImportError:
+    distro = os.environ.get("ROS_DISTRO", "jazzy")
+    sys.path.append(f"/opt/ros/{distro}/lib/python3.12/site-packages")
+
+import numpy as np  # noqa: E402
+from sensor_msgs.msg import Image  # noqa: E402
+
+
+def parse_args(argv):
+    path = topic = None
+    rate_hz = 5.0
+    depth_topic = ""
+    obstacles = []
+    it = iter(argv)
+    for a in it:
+        if a == "--obs":
+            obstacles.append(next(it))
+        elif a == "--depth-topic":
+            depth_topic = next(it)
+        elif path is None:
+            path = a
+        elif topic is None:
+            topic = a
+        else:
+            rate_hz = float(a)
+    return path, topic, rate_hz, depth_topic, obstacles
+
+
+def default_depth_topic(rgb_topic: str) -> str:
+    """由 RGB 话题名推深度话题：常见后缀整体替换，避免字符串拼接残尾。"""
+    for suffix, repl in (
+            ("/rgb/image_rect_color", "/depth/depth_registered"),
+            ("/rgb/image_raw", "/depth/image_raw"),
+            ("/image_rect_color", "/depth_registered"),
+            ("/image_raw", "/depth_registered"),
+            ("/image", "/depth_registered")):
+        if rgb_topic.endswith(suffix):
+            return rgb_topic[: -len(suffix)] + repl
+    return rgb_topic.rstrip("/") + "/depth_registered"
+
+
+def build_depth(shape, obstacles):
+    h, w = shape
+    rows = np.linspace(6.0, 0.5, h, dtype=np.float32)   # 顶行 6m → 底行 0.5m
+    depth = np.repeat(rows[:, None], w, axis=1)
+    for spec in obstacles:
+        try:
+            x0, y0, x1, y1 = (int(v) for v in spec.split(","))
+        except ValueError:
+            print(f"error: --obs 需要 x0,y0,x1,y1，收到 {spec!r}", file=sys.stderr)
+            sys.exit(2)
+        depth[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = 0.3   # 0.3m 近障碍
+    return depth
+
+
+def main() -> int:
+    path, topic, rate_hz, depth_topic, obstacles = parse_args(sys.argv[1:])
+    if path is None:
+        print(__doc__, file=sys.stderr)
+        return 2
+    topic = topic or "/zed/zed_node/rgb/image_rect_color"
+    depth_topic = depth_topic or default_depth_topic(topic)
+
+    import cv2  # noqa: F401  (venv 里一定有)
+
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        print(f"error: cannot read image {path!r}", file=sys.stderr)
+        return 1
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    depth = build_depth(rgb.shape[:2], obstacles)
+
+    rclpy.init()
+    node = rclpy.create_node("image_replay")
+    pub_rgb = node.create_publisher(Image, topic, 10)
+    pub_depth = node.create_publisher(Image, depth_topic, 10)
+
+    h, w = rgb.shape[:2]
+    msg_rgb = Image()
+    msg_rgb.header.frame_id = "replay_camera"
+    msg_rgb.height, msg_rgb.width = h, w
+    msg_rgb.encoding = "rgb8"
+    msg_rgb.is_bigendian = 0
+    msg_rgb.step = w * 3
+    msg_rgb.data = array("B", rgb.tobytes())
+
+    msg_d = Image()
+    msg_d.header.frame_id = "replay_camera"
+    msg_d.height, msg_d.width = h, w
+    msg_d.encoding = "32fc1"
+    msg_d.is_bigendian = 0
+    msg_d.step = w * 4
+    msg_d.data = depth.tobytes()
+
+    def publish():
+        stamp = node.get_clock().now().to_msg()
+        msg_rgb.header.stamp = stamp
+        msg_d.header.stamp = stamp           # 同一时间戳，保证近似时间同步配对
+        pub_rgb.publish(msg_rgb)
+        pub_depth.publish(msg_d)
+
+    node.create_timer(1.0 / rate_hz, publish)
+    node.get_logger().info(
+        f"replaying {path} ({w}x{h}) on {topic} + {depth_topic} @ {rate_hz}Hz"
+        + (f" obstacles={obstacles}" if obstacles else ""))
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
