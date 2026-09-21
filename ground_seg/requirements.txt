@@ -1,6 +1,8 @@
 # torch/torchvision must come from the CUDA 128 index (RTX 5060 Ti / sm_120 needs torch >= 2.7):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 numpy
+# Navigation uses cv2 drawing/imwrite and ROS Image messages only; no Qt/
+# HighGUI display backend is needed.
 opencv-python-headless
 pillow
 scikit-learn

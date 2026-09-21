@@ -1,65 +1,73 @@
-# DINOv3 quadruped visual navigation parameters.
-# Planner architecture:
-#   RGB + registered depth -> DINO traversability -> local BEV
-#   -> footprint inflation -> trajectory rollout -> cmd_vel
-
+# DINOv3 RGB-D quadruped local navigation parameters.
+# Perception stays in ground_seg; this package provides metric BEV +
+# footprint-aware planning in base_link.
 dinov3_nav:
   ros__parameters:
-
     # ================= Topics =================
     image_topic: /zed/zed_node/rgb/image_rect_color
     depth_topic: /zed/zed_node/depth/depth_registered
     camera_info_topic: /zed/zed_node/rgb/camera_info
-
-    goal_pose_topic: /goal_pose
     cmd_vel_topic: /cmd_vel
+    goal_pose_topic: /goal_pose
 
     ground_mask_topic: /dinov3_nav/ground_mask
     traversable_mask_topic: /dinov3_nav/traversable_mask
     safe_mask_topic: /dinov3_nav/safe_mask
     obstacle_mask_topic: /dinov3_nav/obstacle_mask
     overlay_topic: /dinov3_nav/overlay
+    bev_debug_topic: /dinov3_nav/bev_debug
+    raw_bev_topic: /dinov3_nav/raw_bev
+    planning_bev_topic: /dinov3_nav/planning_bev
     coverage_topic: /dinov3_nav/coverage
-
+    planner_status_topic: /dinov3_nav/planner_status
     publish_overlay: true
+    publish_bev_debug: true
+    # publish_bev_debug also enables text-free planning layer topics:
+    # raw_bev, planning_bev, bev_traversability, bev_obstacle, bev_observed,
+    # bev_free, bev_unknown, bev_inflated_obstacle, bev_clearance, bev_cost.
 
-    # ================= TF / coordinate frames =================
-    # Your current TF already has odom -> zed_camera_link, so this default runs now.
-    # If the robot has a true body-centered base_link, change this to base_link.
-    base_frame: zed_camera_link
-
-    # IMPORTANT:
-    # RGB-D pinhole back-projection requires an optical frame:
-    #   X right, Y down, Z forward.
-    # Empty string means CameraInfo.header.frame_id is used.
-    # If CameraInfo frame is not optical, set the real optical frame explicitly,
-    # for example: zed_left_camera_optical_frame
-    camera_optical_frame: ""
-
-    # Goal messages without frame_id are interpreted in this frame.
+    # ================= Frames =================
+    # Local BEV / trajectory poses / footprint live here. Must be base_link
+    # (or any body frame); NEVER the camera frame.
+    planner_frame: base_link
+    # Global goal frame (PoseStamped without frame_id is assumed to be here).
     global.default_goal_frame: odom
 
-    # ================= Robot geometry =================
-    # Replace length with the real body length before enabling motion.
-    robot.width: 0.40
-    robot.length: 0.65
+    # Camera frame for TF lookup. Empty -> use CameraInfo.header.frame_id
+    # (zed_camera_link in the Gazebo sim; the sim's rl_nav_controller or
+    # enable_zed_static_tf publishes base_link <- zed_camera_link).
+    camera.frame: ""
+    # Pixel-data convention of the depth/RGB pinhole data.
+    #   optical: x right, y down, z forward (Gazebo zed_x camera; the frame_id
+    #            names a body-oriented frame, so the fixed optical->body
+    #            rotation is composed inside the node). DEFAULT, verified
+    #            against gazebo_sim_ws_3 .../urdf/zed_x_camera.xacro.
+    #   body:    the TF camera frame itself already has optical axes.
+    camera.projection_convention: optical
 
-    # Extra clearance outside the body circumscribed footprint.
-    robot.safety_margin: 0.10
+    # ================= Robot body =================
+    # Rectangular footprint in planner frame. Replace with measured values
+    # before enabling control. Robot center is (0,0) because the planner
+    # frame is base_link.
+    robot.length: 0.65
+    robot.width: 0.6
+    robot.safety_margin: 0.1
+    robot.center_x: 0.0
+    robot.center_y: 0.0
+    robot.footprint_sample_step: 0.05
 
     # ================= Depth =================
     depth.enable: true
-    depth.min_valid: 0.20
-    depth.safe_distance: 1.00
-
-    # Bottom part of forward image is exempt from the simple near-depth obstacle rule,
-    # because nearby floor itself has small range.
+    # Extra multiplier after encoding conversion (32FC1=m, 16UC1=mm).
+    depth.scale: 1.0
+    # Only used for the image-space debug overlay now; BEV obstacles come
+    # from 3-D height above the estimated ground plane.
+    depth.safe_distance: 1.0
     depth.bottom_exempt_frac: 0.35
-
+    depth.min_valid: 0.20
     depth.sync_slop: 0.05
-    depth.sync_queue: 10
 
-    # ================= DINOv3 ground segmentation =================
+    # ================= DINOv3 ground_seg =================
     ckpt: /home/dow/DOW/dinov3/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
     resolution: 448
     device: auto
@@ -70,8 +78,11 @@ dinov3_nav:
     # ================= SAM2 =================
     sam2.enable: true
     sam2.ckpt: /home/dow/DOW/dinov3/third_party/sam2/checkpoints/sam2.1_hiera_tiny.pt
+    # Do not let RGB-only SAM2 expand far outside the depth-vetted coarse
+    # mask (hard geometric obstacles must not be re-added by SAM2).
+    sam2.max_expand_px: 12
 
-    # ================= Stairs head =================
+    # ================= Optional stairs head =================
     stairs.enable: false
     stairs.threshold: 0.45
     stairs.min_area: 0.008
@@ -80,68 +91,120 @@ dinov3_nav:
     stairs.treat_traversable: true
 
     # ================= Local BEV =================
-    # planner frame convention:
-    #   +x forward, +y left
+    # x forward, y left, expressed in base_link. x_min < 0 keeps the robot's
+    # own footprint inside the grid (collision checks at the current pose).
     bev.resolution: 0.05
-
-    bev.x_min: 0.0
-    bev.x_max: 4.0
-    bev.y_min: -2.0
-    bev.y_max: 2.0
-
+    bev.x_min: -0.80
+    bev.x_max: 4.00
+    bev.y_min: -2.20
+    bev.y_max: 2.20
     bev.max_depth: 6.0
-
-    # Project every N image pixels to reduce CPU cost.
     bev.pixel_stride: 2
-
     bev.min_observed_points: 1
     bev.min_obstacle_points: 2
-
-    # Current DINO output is binary, so 0.5 is appropriate.
-    # Later this can directly become the threshold for continuous CAT-style traversability.
+    # Fill only small RGB-D raster holes; do not freely grow the boundary.
+    bev.close_radius_m: 0.08
+    bev.support_traversability: 0.70
+    # Geometric obstacle evidence relative to the estimated ground plane:
+    # point higher than ground+obstacle_height -> hard obstacle evidence,
+    # lower than ground-drop_height -> hole/drop (non-traversable).
+    bev.obstacle_height: 0.15
+    bev.drop_height: 0.25
+    bev.min_ground_z_points: 200
+    # Fail-safe: stop if less than this fraction of BEV cells is observed.
+    bev.min_observed_fraction: 0.05
+    # Sparse RGB-D ground hits are connected only along sampled rays whose
+    # endpoints are already DINO+geometry ground; occluded space stays unknown.
+    bev.visibility_raycast: true
+    bev.visibility_raycast_stride_px: 8
+    # Continuous traversability thresholds for the footprint checker.
     bev.traversability_threshold: 0.50
+    bev.hard_nontrav_threshold: 0.15
+    bev.hard_nontrav_min_cells: 3
+    # Short-horizon motion-compensated temporal fusion in base_link.  Previous
+    # evidence is transformed through odom, decayed, then fused with raw BEV.
+    bev.temporal_enable: true
+    bev.temporal_frame: odom
+    bev.temporal_half_life_s: 0.70
+    bev.temporal_max_evidence: 6.0
+    bev.temporal_observation_hit: 1.0
+    bev.temporal_obstacle_hit: 2.0
+    bev.temporal_obstacle_clear: 1.5
+    bev.temporal_min_observed_evidence: 0.50
+    bev.temporal_obstacle_threshold: 1.25
+    # Only weak one-cell temporal fragments are dropped; geometric hard hits
+    # remain intact and are never removed by ego clearing.
+    bev.cleanup_min_obstacle_cells: 2
+    bev.ego_clear_radius_m: 0.30
+    bev.ego_clear_traversability: 0.80
 
-    # ================= Trajectory planner =================
-    planner.horizon: 2.0
-    planner.dt: 0.10
+    # ================= Planning costmap =================
+    # Hard / inflated obstacles are forbidden. Unknown remains available at a
+    # high cost; clearance raises cost near obstacles so future A*/GDF chooses
+    # open corridor centres rather than grazing obstacle edges.
+    planning.unknown_cost: 3.0
+    planning.nontraversable_cost: 6.0
+    planning.clearance_target_m: 0.45
+    planning.clearance_cost_weight: 4.0
 
-    planner.v_samples: [0.15, 0.30, 0.45]
-    planner.w_samples: [-0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8]
+    # ================= GDF + SDF local planner =================
+    # GDF is Dijkstra cost-to-go through free cells. Unknown is allowed with
+    # a penalty instead of being converted into an obstacle.
+    gdf.unknown_cost: 2.0
+    gdf.obstacle_inflation_m: 0.20 # m, hard obstacle dilation for this GDF stage
+    gdf.goal_search_radius_m: 1.0
+    gdf.lookahead_m: 0.70
+    # A footprint-width forward corridor triggers local avoidance.  It is
+    # deliberately independent of GDF: when this corridor is clear, the
+    # controller tracks the global goal directly.
+    gdf.corridor_lookahead_m: 1.20
+    gdf.corridor_half_width_m: 0.40 # robot half-width + lateral margin
+    gdf.corridor_emergency_m: 0.30
+    # Consecutive frames for which both the forward and global-goal corridors
+    # must be clear before an AVOID state returns to GO_TO_GOAL.
+    gdf.avoid_exit_clear_frames: 6
+    # Retained as a soft local descent preference; the state machine makes
+    # the actual left/right commitment persistent across frames.
+    gdf.side_lock_s: 1.5
+    gdf.side_hysteresis_m: 0.15
+    gdf.avoid_heading_delta_deg: 12.0
+    # A GDF detour is already checked in the inflated free map. Let the
+    # quadruped move on a slow arc for ordinary detour angles; reserve pure
+    # rotation for near-reverse headings or emergency obstacle proximity.
+    gdf.avoid_turn_in_place_angle_deg: 75.0
+    gdf.avoid_min_linear: 0.08
+    # SDF is clearance only. It corrects the GDF heading near obstacles but
+    # never chooses the main left/right route.
+    sdf.clearance_target_m: 0.45
+    sdf.clearance_emergency_m: 0.18
+    sdf.clearance_gain: 1.25
 
-    # Forward blind zone around the camera/robot origin.
-    planner.start_ignore_distance: 0.25
-
-    # Clearance score saturates after this distance.
-    planner.clearance_cap: 0.80
-
-    # Cost weights.
-    planner.progress_weight: 2.0
-    planner.traversability_weight: 1.0
-    planner.clearance_weight: 1.2
-    planner.heading_weight: 0.8
-    planner.turn_weight: 0.25
-    planner.smooth_weight: 0.20
-
-    planner.turn_in_place_angle_deg: 35.0
-    planner.turn_gain: 1.2
-
-    # ================= Global goal =================
-    global.enable: true
-    global.goal_tolerance: 0.35
-
-    # ================= cmd_vel safety =================
-    control.enabled: false
-
-    # Keep false until BEV axes / obstacle locations / TF are verified.
-    # After verification set control.enabled: true.
-    control.max_angular: 0.8
+    # ================= Control / global target =================
+    # SAFETY: control stays off until TF + CameraInfo + projection sanity
+    # are verified (watch /dinov3_nav/bev_debug first). Sanity failure
+    # independently forces cmd_vel = 0 even when enabled.
+    control.enabled: true
+    control.max_angular: 1.2
+    control.cruise_linear: 0.35
+    control.angular_gain: 1.5
+    control.turn_in_place_angle_deg: 43.0
     control.cmd_rate: 10.0
     control.watchdog: 1.5
+    control.goal_tolerance: 0.35
 
-    # ================= Runtime =================
+    global.enable: true
+
+    # ================= Runtime / saved debug images =================
     process_period: 0.10
-
-    # ================= Debug output =================
     output.enable: true
     output.dir: ""
-    output.save_every: 1
+    output.save_every: 5
+
+    # ================= Live GDF/SDF debug =================
+    # Requires a graphical display in the launch environment. It shows BEV,
+    # GDF heat map, obstacle inflation, goal (yellow), GDF path (cyan), and
+    # final SDF-corrected heading (magenta).
+    # Images are saved/published with OpenCV only; no HighGUI/Qt popup.
+    debug.show_window: false
+    debug.window_name: DINOv3_GDF_SDF_BEV
+    debug.window_scale: 1.0

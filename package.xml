@@ -2,21 +2,19 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>dinov3_nav</name>
-  <version>0.2.0</version>
-  <description>DINOv3 RGB-D traversability navigation with local BEV, robot-footprint inflation, and trajectory rollout control.</description>
+  <version>0.3.0</version>
+  <description>DINOv3 RGB-D traversability navigation: base_link metric BEV, rectangular footprint checks, goal-directed trajectory rollout with rotate recovery.</description>
 
   <maintainer email="dow@todo.todo">dow</maintainer>
   <license>MIT</license>
 
-  <!-- torch / DINOv3 / ground_seg stay in the project venv. -->
+  <!-- torch / DINOv3 / ground_seg / SAM2 are supplied by the project venv. -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>message_filters</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
-
-  <!-- launch-time dependencies -->
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

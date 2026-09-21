@@ -1,141 +1,140 @@
 #!/home/dow/DOW/dinov3/.venv/bin/python
 # -*- coding: utf-8 -*-
-"""把静态图片 + 合成深度循环发布成相机话题（没有 ZED / 实车时的联调工具）。
+"""Replay one RGB image with synthetic registered depth and CameraInfo.
 
-    ros2 run dinov3_nav image_replay test_images/galileo_test_2.jpg
-    ros2 run dinov3_nav image_replay img.jpg /camera/image 2.0
-    # 在画面中部注入一个 0.3m 近距障碍矩形，测避障转向：
-    ros2 run dinov3_nav image_replay img.jpg --obs x0,y0,x1,y1 [--obs ...]
-
-用法：image_replay <图片路径> [RGB 话题，默认 ZED] [频率 Hz，默认 5]
-                  [--depth-topic 名] [--obs x0,y0,x1,y1 ...]
-
-深度是合成的"地面斜坡"：底行 0.5m 线性变到顶行 6m（32FC1 米，与 RGB 同
-时间戳同尺寸），--obs 矩形内覆盖为 0.3m 近距值。RGB/深度同名成对发布
-（深度话题默认把 RGB 话题里的 .../rgb/... 换成 .../depth/depth_registered）。
+Mimics the Gazebo zed_x setup exactly: images are stamped frame_id
+zed_camera_link and the pixel data is optical convention; the static TF
+base_link <- zed_camera_link carries an identity rotation (translation
+0.435 0 0.10, galileov1). Run the nav node with default params
+(planner_frame base_link, camera.projection_convention optical) and the
+replay exercises the same code path as the real sim.
 """
-
 import os
 import sys
 from array import array
 
 try:
-    import rclpy  # noqa: F401
+    import rclpy
 except ImportError:
     distro = os.environ.get("ROS_DISTRO", "jazzy")
     sys.path.append(f"/opt/ros/{distro}/lib/python3.12/site-packages")
+    import rclpy
 
-import numpy as np  # noqa: E402
-from sensor_msgs.msg import Image  # noqa: E402
+import cv2
+import numpy as np
+from geometry_msgs.msg import TransformStamped
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 
 def parse_args(argv):
-    path = topic = None
+    path = None
     rate_hz = 5.0
-    depth_topic = ""
     obstacles = []
     it = iter(argv)
     for a in it:
         if a == "--obs":
             obstacles.append(next(it))
-        elif a == "--depth-topic":
-            depth_topic = next(it)
+        elif a == "--rate":
+            rate_hz = float(next(it))
         elif path is None:
             path = a
-        elif topic is None:
-            topic = a
-        else:
-            rate_hz = float(a)
-    return path, topic, rate_hz, depth_topic, obstacles
-
-
-def default_depth_topic(rgb_topic: str) -> str:
-    """由 RGB 话题名推深度话题：常见后缀整体替换，避免字符串拼接残尾。"""
-    for suffix, repl in (
-            ("/rgb/image_rect_color", "/depth/depth_registered"),
-            ("/rgb/image_raw", "/depth/image_raw"),
-            ("/image_rect_color", "/depth_registered"),
-            ("/image_raw", "/depth_registered"),
-            ("/image", "/depth_registered")):
-        if rgb_topic.endswith(suffix):
-            return rgb_topic[: -len(suffix)] + repl
-    return rgb_topic.rstrip("/") + "/depth_registered"
+    return path, rate_hz, obstacles
 
 
 def build_depth(shape, obstacles):
     h, w = shape
-    rows = np.linspace(6.0, 0.5, h, dtype=np.float32)   # 顶行 6m → 底行 0.5m
+    rows = np.linspace(6.0, 0.6, h, dtype=np.float32)
     depth = np.repeat(rows[:, None], w, axis=1)
     for spec in obstacles:
-        try:
-            x0, y0, x1, y1 = (int(v) for v in spec.split(","))
-        except ValueError:
-            print(f"error: --obs 需要 x0,y0,x1,y1，收到 {spec!r}", file=sys.stderr)
-            sys.exit(2)
-        depth[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = 0.3   # 0.3m 近障碍
+        x0, y0, x1, y1 = (int(v) for v in spec.split(","))
+        depth[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = 0.45
     return depth
 
 
-def main() -> int:
-    path, topic, rate_hz, depth_topic, obstacles = parse_args(sys.argv[1:])
-    if path is None:
-        print(__doc__, file=sys.stderr)
+def main():
+    path, rate_hz, obstacles = parse_args(sys.argv[1:])
+    if not path:
+        print("usage: image_replay image.jpg [--rate 5] [--obs x0,y0,x1,y1]", file=sys.stderr)
         return 2
-    topic = topic or "/zed/zed_node/rgb/image_rect_color"
-    depth_topic = depth_topic or default_depth_topic(topic)
-
-    import cv2  # noqa: F401  (venv 里一定有)
-
     bgr = cv2.imread(path, cv2.IMREAD_COLOR)
     if bgr is None:
-        print(f"error: cannot read image {path!r}", file=sys.stderr)
+        print(f"cannot read {path!r}", file=sys.stderr)
         return 1
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    depth = build_depth(rgb.shape[:2], obstacles)
+    h, w = rgb.shape[:2]
+    depth = build_depth((h, w), obstacles)
 
     rclpy.init()
     node = rclpy.create_node("image_replay")
-    pub_rgb = node.create_publisher(Image, topic, 10)
+    rgb_topic = "/zed/zed_node/rgb/image_rect_color"
+    depth_topic = "/zed/zed_node/depth/depth_registered"
+    info_topic = "/zed/zed_node/rgb/camera_info"
+    pub_rgb = node.create_publisher(Image, rgb_topic, 10)
     pub_depth = node.create_publisher(Image, depth_topic, 10)
+    pub_info = node.create_publisher(CameraInfo, info_topic, 10)
 
-    h, w = rgb.shape[:2]
+    # Same layout as the Gazebo sim: body-oriented zed_camera_link with an
+    # identity rotation vs base_link; pixel data stays optical convention
+    # (the nav node composes the optical->body rotation itself).
+    optical_frame = "zed_camera_link"
+    planner_frame = "base_link"
+    broadcaster = StaticTransformBroadcaster(node)
+    tf = TransformStamped()
+    tf.header.stamp = node.get_clock().now().to_msg()
+    tf.header.frame_id = planner_frame
+    tf.child_frame_id = optical_frame
+    tf.transform.translation.x = 0.435
+    tf.transform.translation.y = 0.0
+    tf.transform.translation.z = 0.10
+    broadcaster.sendTransform(tf)
+
     msg_rgb = Image()
-    msg_rgb.header.frame_id = "replay_camera"
+    msg_rgb.header.frame_id = optical_frame
     msg_rgb.height, msg_rgb.width = h, w
     msg_rgb.encoding = "rgb8"
-    msg_rgb.is_bigendian = 0
     msg_rgb.step = w * 3
     msg_rgb.data = array("B", rgb.tobytes())
 
-    msg_d = Image()
-    msg_d.header.frame_id = "replay_camera"
-    msg_d.height, msg_d.width = h, w
-    msg_d.encoding = "32fc1"
-    msg_d.is_bigendian = 0
-    msg_d.step = w * 4
-    msg_d.data = depth.tobytes()
+    msg_depth = Image()
+    msg_depth.header.frame_id = optical_frame
+    msg_depth.height, msg_depth.width = h, w
+    msg_depth.encoding = "32FC1"
+    msg_depth.step = w * 4
+    msg_depth.data = depth.tobytes()
+
+    info = CameraInfo()
+    info.header.frame_id = optical_frame
+    info.width, info.height = w, h
+    # Same intrinsics derivation as zed_x_camera.xacro (hfov 1.845264 rad).
+    hfov = 1.845264
+    fx = (w / 2.0) / np.tan(hfov / 2.0)
+    fy = fx
+    cx, cy = w / 2.0, h / 2.0
+    info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+    info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
 
     def publish():
         stamp = node.get_clock().now().to_msg()
         msg_rgb.header.stamp = stamp
-        msg_d.header.stamp = stamp           # 同一时间戳，保证近似时间同步配对
+        msg_depth.header.stamp = stamp
+        info.header.stamp = stamp
         pub_rgb.publish(msg_rgb)
-        pub_depth.publish(msg_d)
+        pub_depth.publish(msg_depth)
+        pub_info.publish(info)
 
-    node.create_timer(1.0 / rate_hz, publish)
+    node.create_timer(1.0 / max(rate_hz, 0.1), publish)
     node.get_logger().info(
-        f"replaying {path} ({w}x{h}) on {topic} + {depth_topic} @ {rate_hz}Hz"
-        + (f" obstacles={obstacles}" if obstacles else ""))
+        f"replay {path} {w}x{h}, camera={optical_frame} (optical pixels, "
+        f"body TF), planner={planner_frame}"
+    )
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+        rclpy.shutdown()
     return 0
 
 

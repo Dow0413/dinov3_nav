@@ -1,0 +1,8 @@
+This package intentionally imports the existing project perception module:
+
+    from ground_seg import GroundSegmenter, SAM2MaskRefiner
+
+The public https://github.com/Dow0413/dinov3_nav main tree inspected on 2026-09-20
+does not contain the ground_seg source directory. The existing launcher expects it under
+DINOV3_ROOT (default /home/dow/DOW/dinov3). Keep your current ground_seg/DINOv3/SAM2
+installation there, or override DINOV3_ROOT.
