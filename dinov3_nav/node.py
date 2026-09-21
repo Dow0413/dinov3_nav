@@ -31,7 +31,7 @@ import numpy as np
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid, Path as NavPath
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
@@ -39,7 +39,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from std_msgs.msg import Float32, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -60,9 +60,12 @@ from .footprint import (
     FootprintChecker,
 )
 from .mppi import MPPIConfig, MPPIPlanner, MPPIResult
+from .astar import AStarLocalPlanner
+from .rolling_map import RollingLocalMap, RollingMapConfig
 from .planning_bev import (
     PlanningCostConfig,
     PlanningBEV,
+    MetricTemporalBEVFusion,
     TemporalBEVConfig,
     TemporalBEVFusion,
     build_planning_bev,
@@ -230,6 +233,17 @@ class Dinov3NavNode(Node):
             visibility_raycast_stride_px=int(p["bev.visibility_raycast_stride_px"]),
         )
         self._min_observed_fraction = float(p["bev.min_observed_fraction"])
+        self._rolling_map = RollingLocalMap(self._bev_cfg, RollingMapConfig(
+            ttl_s=float(p["rolling_map.ttl_s"]),
+            ground_tolerance_m=float(p["lidar.ground_tolerance_m"]),
+            obstacle_height_m=float(p["lidar.obstacle_height_m"]),
+            visual_unknown_value=float(p["rolling_map.visual_unknown_value"]),
+            self_filter_radius_m=float(p["lidar.self_filter_radius_m"]),
+        ))
+        self._astar = AStarLocalPlanner()
+        self._astar_lookahead = float(p["astar.lookahead_m"])
+        self._use_lidar_mapping = bool(p["mapping.use_lidar"])
+        self._latest_visual = None
         # MPPI checks the full rectangular footprint at every rollout pose.
         # Therefore this inflation is only the requested extra clearance;
         # adding half-width here would double-count the body geometry.
@@ -244,7 +258,7 @@ class Dinov3NavNode(Node):
             hard_nontrav_threshold=float(p["bev.hard_nontrav_threshold"]),
             hard_nontrav_min_cells=int(p["bev.hard_nontrav_min_cells"]),
         )
-        self._bev_fusion = TemporalBEVFusion(TemporalBEVConfig(
+        self._bev_fusion = MetricTemporalBEVFusion(TemporalBEVConfig(
             enabled=bool(p["bev.temporal_enable"]),
             evidence_half_life_s=float(p["bev.temporal_half_life_s"]),
             max_evidence=float(p["bev.temporal_max_evidence"]),
@@ -264,8 +278,6 @@ class Dinov3NavNode(Node):
             clearance_cost_weight=float(p["planning.clearance_cost_weight"]),
         )
         self._fusion_frame = str(p["bev.temporal_frame"]).strip()
-        self._prev_fusion_pose: Optional[np.ndarray] = None
-        self._prev_fusion_time: Optional[float] = None
         self._planner = MPPIPlanner(MPPIConfig(
             horizon_steps=int(p["mppi.horizon_steps"]), dt=float(p["mppi.dt"]),
             samples=int(p["mppi.samples"]), temperature=float(p["mppi.temperature"]),
@@ -274,6 +286,13 @@ class Dinov3NavNode(Node):
             max_vy=float(p["mppi.max_vy"]), max_wz=float(p["mppi.max_wz"]),
             max_accel_vx=float(p["mppi.max_accel_vx"]), max_accel_vy=float(p["mppi.max_accel_vy"]), max_accel_wz=float(p["mppi.max_accel_wz"]),
             start_relax_distance=float(p["mppi.start_relax_distance"]),
+            unknown_footprint_weight=float(p["mppi.unknown_footprint_weight"]),
+            exploration_fraction=float(p["mppi.exploration_fraction"]),
+            valid_fraction_slow=float(p["mppi.valid_fraction_slow"]),
+            clearance_slow_m=float(p["mppi.clearance_slow_m"]),
+            slow_speed_scale=float(p["mppi.slow_speed_scale"]),
+            turn_trigger_clearance_m=float(p["mppi.turn_trigger_clearance_m"]),
+            min_detour_wz=float(p["mppi.min_detour_wz"]),
             goal_weight=float(p["mppi.goal_weight"]), terminal_goal_weight=float(p["mppi.terminal_goal_weight"]),
             heading_weight=float(p["mppi.heading_weight"]), costmap_weight=float(p["mppi.costmap_weight"]),
             control_weight=float(p["mppi.control_weight"]), smooth_weight=float(p["mppi.smooth_weight"]),
@@ -284,6 +303,7 @@ class Dinov3NavNode(Node):
         self._control_enabled = bool(p["control.enabled"])
         self._goal_enabled = bool(p["global.enable"])
         self._goal_tolerance = float(p["control.goal_tolerance"])
+        self._mppi_local_goal_distance = float(p["mppi.local_goal_distance"])
         self._watchdog = float(p["control.watchdog"])
         self._cmd: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._odom_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -295,6 +315,11 @@ class Dinov3NavNode(Node):
         self._last_result: Optional[float] = None
         self._last_process: Optional[float] = None
         self._process_period = float(p["process_period"])
+        self._mppi_replan_rate = max(0.5, float(p["mppi.replan_rate"]))
+        self._planning_lock = threading.Lock()
+        self._latest_planning: Optional[PlanningBEV] = None
+        self._latest_mppi_goal: Optional[Tuple[float, float]] = None
+        self._latest_path = None
         self._frame_count = 0
         self._debug_show_window = bool(p["debug.show_window"])
         self._debug_window_name = str(p["debug.window_name"])
@@ -342,6 +367,8 @@ class Dinov3NavNode(Node):
         )
         self._coverage_pub = self.create_publisher(Float32, p["coverage_topic"], 10)
         self._status_pub = self.create_publisher(String, p["planner_status_topic"], 10)
+        self._local_map_pub = self.create_publisher(OccupancyGrid, p["local_map_topic"], 10)
+        self._local_path_pub = self.create_publisher(NavPath, p["local_path_topic"], 10)
         self._overlay_pub = (
             self.create_publisher(Image, p["overlay_topic"], qos_profile_sensor_data)
             if p["publish_overlay"]
@@ -432,6 +459,7 @@ class Dinov3NavNode(Node):
         if self._goal_enabled:
             self.create_subscription(PoseStamped, p["goal_pose_topic"], self._on_goal, 10)
         self.create_subscription(Odometry, p["odom_topic"], self._on_odom, qos_profile_sensor_data)
+        self.create_subscription(PointCloud2, p["lidar_topic"], self._on_lidar, qos_profile_sensor_data)
 
         if self._cmd_pub is not None:
             self.create_timer(
@@ -439,6 +467,11 @@ class Dinov3NavNode(Node):
                 self._on_cmd_timer,
                 callback_group=MutuallyExclusiveCallbackGroup(),
             )
+        self.create_timer(
+            1.0 / self._mppi_replan_rate,
+            self._on_mppi_timer,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
 
         self.get_logger().info(
             "dinov3_nav MPPI planner ready: "
@@ -461,6 +494,9 @@ class Dinov3NavNode(Node):
             "cmd_vel_topic": "/cmd_vel",
             "goal_pose_topic": "/goal_pose",
             "odom_topic": "/odom",
+            "lidar_topic": "/points",
+            "local_map_topic": "/local_map",
+            "local_path_topic": "/local_path",
             "ground_mask_topic": "/dinov3_nav/ground_mask",
             "traversable_mask_topic": "/dinov3_nav/traversable_mask",
             "safe_mask_topic": "/dinov3_nav/safe_mask",
@@ -532,6 +568,13 @@ class Dinov3NavNode(Node):
             "bev.traversability_threshold": 0.50,
             "bev.hard_nontrav_threshold": 0.15,
             "bev.hard_nontrav_min_cells": 3,
+            "rolling_map.ttl_s": 2.0,
+            "rolling_map.visual_unknown_value": 0.55,
+            "lidar.ground_tolerance_m": 0.12,
+            "lidar.obstacle_height_m": 0.18,
+            "lidar.self_filter_radius_m": 0.45,
+            "astar.lookahead_m": 0.9,
+            "mapping.use_lidar": True,
             # Robot-centred temporal map.  Stored evidence is motion-
             # compensated through odom before it is fused with a raw frame.
             "bev.temporal_enable": True,
@@ -570,6 +613,15 @@ class Dinov3NavNode(Node):
             "mppi.max_accel_vy": 0.50,
             "mppi.max_accel_wz": 1.80,
             "mppi.start_relax_distance": 0.90,
+            "mppi.unknown_footprint_weight": 2.0,
+            "mppi.exploration_fraction": 0.35,
+            "mppi.valid_fraction_slow": 0.12,
+            "mppi.clearance_slow_m": 0.35,
+            "mppi.slow_speed_scale": 0.45,
+            "mppi.local_goal_distance": 2.0,
+            "mppi.turn_trigger_clearance_m": 0.45,
+            "mppi.min_detour_wz": 0.05,
+            "mppi.replan_rate": 5.0,
             "mppi.goal_weight": 5.0,
             "mppi.terminal_goal_weight": 10.0,
             "mppi.heading_weight": 0.8,
@@ -627,6 +679,117 @@ class Dinov3NavNode(Node):
         """
         tw = msg.twist.twist
         self._odom_velocity = (float(tw.linear.x), float(tw.linear.y), float(tw.angular.z))
+
+    def _on_mppi_timer(self):
+        """Replan independently of DINO inference using the newest costmap."""
+        with self._planning_lock:
+            planning = self._latest_planning
+            goal = self._latest_mppi_goal
+        if planning is None or goal is None or self._goal_reached or not self._sanity_ok:
+            self._cmd = (0.0, 0.0, 0.0)
+            return
+        try:
+            checker = FootprintChecker(planning.grid, self._foot_cfg, planning.layers)
+            plan = self._planner.plan(planning, checker, goal, self._odom_velocity)
+            self._last_plan = plan
+            self._cmd = plan.command
+            self._last_result = time.monotonic()
+        except Exception as exc:
+            self._cmd = (0.0, 0.0, 0.0)
+            self.get_logger().error(f"MPPI timer failed: {exc}", throttle_duration_sec=5.0)
+
+    @staticmethod
+    def _cloud_xyz(msg: PointCloud2) -> np.ndarray:
+        """Extract x/y/z without requiring sensor_msgs_py in the DINO venv."""
+        fields = {field.name: field for field in msg.fields}
+        if not all(name in fields for name in ("x", "y", "z")) or msg.point_step <= 0:
+            return np.empty((0, 3), np.float32)
+        # ROS PointField.FLOAT32 is datatype 7; most LiDAR drivers use it.
+        if any(fields[name].datatype != 7 for name in ("x", "y", "z")):
+            return np.empty((0, 3), np.float32)
+        dtype = np.dtype({"names": ["x", "y", "z"], "formats": ["<f4"] * 3,
+                          "offsets": [fields[n].offset for n in ("x", "y", "z")],
+                          "itemsize": msg.point_step})
+        raw = np.frombuffer(msg.data, dtype=dtype, count=msg.width * msg.height)
+        points = np.column_stack((raw["x"], raw["y"], raw["z"])).astype(np.float32)
+        return points[np.isfinite(points).all(axis=1)]
+
+    def _publish_local_map(self, bev, header) -> None:
+        msg = OccupancyGrid(); msg.header = header; msg.header.frame_id = self._planner_frame
+        msg.info.resolution = float(bev.cfg.resolution)
+        msg.info.width, msg.info.height = int(bev.shape[0]), int(bev.shape[1])
+        msg.info.origin.position.x, msg.info.origin.position.y = bev.cfg.x_min, bev.cfg.y_min
+        msg.info.origin.orientation.w = 1.0
+        values = np.full(bev.shape, -1, np.int8)
+        values[bev.observed & (bev.traversability >= .5)] = 0
+        values[bev.observed & (bev.traversability < .5)] = 50
+        values[bev.obstacle] = 100
+        # OccupancyGrid rows are y, columns x; BEV storage is x, y.
+        msg.data = values.T.reshape(-1).tolist(); self._local_map_pub.publish(msg)
+
+    def _publish_local_path(self, path, header) -> None:
+        msg = NavPath(); msg.header = header; msg.header.frame_id = self._planner_frame
+        for x, y in path.points:
+            pose = PoseStamped(); pose.header = msg.header; pose.pose.position.x = x; pose.pose.position.y = y; pose.pose.orientation.w = 1.0
+            msg.poses.append(pose)
+        self._local_path_pub.publish(msg)
+
+    def _on_lidar(self, msg: PointCloud2):
+        """LiDAR owns geometry; DINO only annotates camera-visible ground."""
+        points = self._cloud_xyz(msg)
+        if not len(points): return
+        try:
+            lidar_frame = msg.header.frame_id
+            T_base_lidar = transform_to_matrix(self._tf_buffer.lookup_transform(
+                self._planner_frame, lidar_frame, Time(), timeout=Duration(seconds=.10)).transform)
+            points_base = points @ T_base_lidar[:3, :3].T + T_base_lidar[:3, 3]
+            T_odom_base = transform_to_matrix(self._tf_buffer.lookup_transform(
+                self._fusion_frame, self._planner_frame, Time(), timeout=Duration(seconds=.10)).transform)
+        except TransformException as exc:
+            self.get_logger().warning(f"LiDAR TF unavailable: {exc}", throttle_duration_sec=5.0); return
+        visual = np.full(len(points_base), float(self._rolling_map.cfg.visual_unknown_value), np.float32)
+        latest = self._latest_visual
+        if latest is not None:
+            mask, K, T_base_camera = latest
+            T_camera_base = np.linalg.inv(T_base_camera)
+            cam = points_base @ T_camera_base[:3, :3].T + T_camera_base[:3, 3]
+            z = cam[:, 2]
+            u = np.full(len(cam), -1, np.int32); v = np.full(len(cam), -1, np.int32)
+            front = np.isfinite(z) & (z > .05)
+            u[front] = np.rint(K[0,0]*cam[front,0]/z[front]+K[0,2]).astype(np.int32)
+            v[front] = np.rint(K[1,1]*cam[front,1]/z[front]+K[1,2]).astype(np.int32)
+            inside = front & (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
+            visual[inside] = (mask[v[inside], u[inside]] > 0).astype(np.float32)
+        now = time.monotonic(); self._rolling_map.add(points_base, visual, T_odom_base, now)
+        bev = self._rolling_map.rasterize(T_odom_base, now)
+        planning = build_planning_bev(bev, self._foot_cfg, self._planning_cost_cfg)
+        start_check = FootprintChecker(planning.grid, self._foot_cfg, planning.layers).check_pose(
+            0.0, 0.0, 0.0, relax_surface=True
+        )
+        if not start_check.valid:
+            self.get_logger().warning(
+                f"local_map blocks robot footprint ({start_check.reason}); "
+                f"obstacle_cells={int(planning.hard_obstacle.sum())}, "
+                f"inflated_cells={int(planning.inflated_obstacle.sum())}. "
+                "Check LiDAR frame, lidar.self_filter_radius_m and debug map.",
+                throttle_duration_sec=3.0,
+            )
+        goal, _ = self._goal_in_planner()
+        path = self._astar.plan(planning, self._local_mppi_goal(goal)) if goal is not None else None
+        lookahead = self._astar.lookahead(path, self._astar_lookahead) if path is not None else None
+        with self._planning_lock:
+            self._latest_planning, self._latest_mppi_goal, self._latest_path = planning, lookahead, path
+        self._publish_local_map(bev, msg.header)
+        if path is not None: self._publish_local_path(path, msg.header)
+        if self._bev_debug_pub is not None:
+            image = render_bev_debug(
+                planning.grid, planning.layers, self._last_plan, goal, scale=5,
+                footprint=(self._foot_cfg.length, self._foot_cfg.width),
+                reference_path=(path.points if path is not None else None),
+            )
+            debug_msg = rgb_to_image_msg(image, msg.header)
+            debug_msg.header.frame_id = self._planner_frame
+            self._bev_debug_pub.publish(debug_msg)
 
     def _on_images(self, rgb_msg: Image, depth_msg: Image):
         self._process(rgb_msg, depth_msg)
@@ -767,40 +930,33 @@ class Dinov3NavNode(Node):
         gx, gy = float(local[0]), float(local[1])
         return (gx, gy), hypot(gx, gy)
 
+    def _local_mppi_goal(self, goal: Tuple[float, float]) -> Tuple[float, float]:
+        """Keep terminal optimisation inside the metric horizon/costmap."""
+        d = hypot(*goal)
+        lookahead = max(0.2, self._mppi_local_goal_distance)
+        if d <= lookahead:
+            return goal
+        return goal[0] * lookahead / d, goal[1] * lookahead / d
+
     def _fuse_raw_bev(self, raw_bev):
-        """Motion-compensate prior evidence, then fuse this raw sensor frame."""
+        """Re-rasterize short-term metric observations into current base_link."""
         now = time.monotonic()
-        T_current_from_previous = None
-        current_pose = None
+        T_temporal_from_current = None
         if self._fusion_frame:
             try:
                 tf = self._tf_buffer.lookup_transform(
                     self._fusion_frame, self._planner_frame, Time(),
                     timeout=Duration(seconds=0.15),
                 )
-                current_pose = transform_to_matrix(tf.transform)
-                if self._prev_fusion_pose is not None:
-                    relative = np.linalg.inv(current_pose) @ self._prev_fusion_pose
-                    T_current_from_previous = relative[:3, :3]
-                    T_current_from_previous = np.array(
-                        [[relative[0, 0], relative[0, 1], relative[0, 3]],
-                         [relative[1, 0], relative[1, 1], relative[1, 3]],
-                         [0.0, 0.0, 1.0]], np.float32,
-                    )
+                T_temporal_from_current = transform_to_matrix(tf.transform)
             except TransformException as exc:
                 self._bev_fusion.reset()
-                self._prev_fusion_pose = None
-                self._prev_fusion_time = None
                 self.get_logger().warning(
                     f"temporal BEV TF unavailable ({self._fusion_frame} <- "
                     f"{self._planner_frame}); using raw frame: {exc}",
                     throttle_duration_sec=5.0,
                 )
-        dt = 0.0 if self._prev_fusion_time is None else now - self._prev_fusion_time
-        stable = self._bev_fusion.update(raw_bev, dt, T_current_from_previous)
-        self._prev_fusion_pose = current_pose
-        self._prev_fusion_time = now
-        return stable
+        return self._bev_fusion.update(raw_bev, now, T_temporal_from_current)
 
     def _depth_obstacle(self, depth: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
         """Image-space near-depth obstacle (debug overlay only; the BEV uses
@@ -995,17 +1151,24 @@ class Dinov3NavNode(Node):
             goal_distance is not None and goal_distance <= self._goal_tolerance
         )
 
-        plan: Optional[MPPIResult] = None
+        plan: Optional[MPPIResult] = self._last_plan
         bev_debug = None
         bev = None
         raw_bev = None
         planning: Optional[PlanningBEV] = None
         near_obstacle = self._depth_obstacle(depth, rgb.shape[:2])
+        # Visual traversability remains useful without RGB-D: LiDAR later
+        # projects its own metric points into this latest camera mask.
+        K_visual = self._camera_matrix(rgb.shape[:2])
+        T_visual = self._camera_to_planner()
+        if K_visual is not None and T_visual is not None:
+            self._latest_visual = (traversable.copy(), K_visual.copy(), T_visual.copy())
         if self._goal_reached:
             self._cmd = (0.0, 0.0, 0.0)
         elif depth is None:
-            self._cmd = (0.0, 0.0, 0.0)
-            self.get_logger().warning("BEV planner requires depth", throttle_duration_sec=5.0)
+            if not self._use_lidar_mapping:
+                self._cmd = (0.0, 0.0, 0.0)
+                self.get_logger().warning("BEV planner requires depth", throttle_duration_sec=5.0)
         else:
             K = self._camera_matrix(depth.shape)
             T = self._camera_to_planner()
@@ -1015,6 +1178,9 @@ class Dinov3NavNode(Node):
             elif T is None:
                 self._cmd = (0.0, 0.0, 0.0)
             else:
+                # LiDAR callback uses this only to annotate geometry points
+                # inside the current camera FOV; it never creates obstacles.
+                self._latest_visual = (traversable.copy(), K.copy(), T.copy())
                 if self._sanity_ok is None:
                     self._sanity_ok = self._projection_sanity(K, T)
                 try:
@@ -1041,15 +1207,21 @@ class Dinov3NavNode(Node):
                         planning = build_planning_bev(
                             bev, self._foot_cfg, self._planning_cost_cfg
                         )
+                        mppi_goal = (self._local_mppi_goal(local_goal)
+                                     if local_goal is not None else None)
+                        if not self._use_lidar_mapping:
+                            with self._planning_lock:
+                                self._latest_planning = planning
+                                self._latest_mppi_goal = mppi_goal
                         if local_goal is None:
                             # Map production is intentionally independent of
                             # navigation authority. This lets raw/planning BEV
                             # be inspected before a global goal is issued.
                             self._cmd = (0.0, 0.0, 0.0)
                         else:
-                            checker = FootprintChecker(planning.grid, self._foot_cfg, planning.layers)
-                            plan = self._planner.plan(planning, checker, local_goal, self._odom_velocity)
-                            self._cmd = plan.command
+                            # The MPPI timer consumes this immutable planning
+                            # product independently of the slow DINO callback.
+                            plan = self._last_plan
                         if (self._bev_debug_pub is not None or self._out_dir is not None
                                 or self._debug_window_active):
                             bev_debug = render_bev_debug(
@@ -1062,7 +1234,6 @@ class Dinov3NavNode(Node):
                     )
                     self._cmd = (0.0, 0.0, 0.0)
 
-        self._last_plan = plan
         self._last_result = time.monotonic()
         elapsed = time.perf_counter() - t0
 
@@ -1097,7 +1268,9 @@ class Dinov3NavNode(Node):
             )
             if self._overlay_pub is not None:
                 self._overlay_pub.publish(rgb_to_image_msg(overlay, header))
-        if self._bev_debug_pub is not None and bev_debug is not None:
+        # With LiDAR mapping enabled, /bev_debug must show exactly the map
+        # consumed by A*/MPPI, published by _on_lidar below.
+        if self._bev_debug_pub is not None and bev_debug is not None and not self._use_lidar_mapping:
             msg = rgb_to_image_msg(bev_debug, header)
             msg.header.frame_id = self._planner_frame
             self._bev_debug_pub.publish(msg)
@@ -1185,7 +1358,8 @@ class Dinov3NavNode(Node):
         vx, vy, wz = plan.command
         return (
             f"{plan.mode} {goal_txt} valid={plan.effective_samples}/{len(plan.candidates)} "
-            f"cost={plan.best_cost:.2f} reject={plan.diagnostics} sel=({vx:.2f},{vy:+.2f},{wz:+.2f}) "
+            f"cost={plan.best_cost:.2f} clear={plan.min_clearance_m:.2f}m "
+            f"reject={plan.diagnostics} sel=({vx:.2f},{vy:+.2f},{wz:+.2f}) "
             f"cmd=({self._cmd[0]:.2f},{self._cmd[1]:+.2f},{self._cmd[2]:+.2f})"
         )
 

@@ -150,6 +150,7 @@ class FootprintChecker:
         yaw: float,
         relax_surface: bool = False,
         ignore_inflation: bool = False,
+        unknown_is_soft: bool = False,
     ) -> FootprintCheck:
         """Pose feasibility for the rectangular footprint.
 
@@ -175,7 +176,7 @@ class FootprintChecker:
             # all cells under/behind the robot. Collision remains a hard check.
             return FootprintCheck(True, "ok", unknown_fraction, 1.0, 1.0)
 
-        if unknown_fraction > self.cfg.max_unknown_fraction:
+        if not unknown_is_soft and unknown_fraction > self.cfg.max_unknown_fraction:
             return FootprintCheck(False, "unknown", unknown_fraction, 0.0, 0.0)
 
         observed_idx = observed

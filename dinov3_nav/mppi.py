@@ -44,6 +44,13 @@ class MPPIConfig:
     costmap_weight: float = 1.0
     control_weight: float = 0.08
     smooth_weight: float = 0.35
+    unknown_footprint_weight: float = 2.0
+    exploration_fraction: float = 0.35
+    valid_fraction_slow: float = 0.12
+    clearance_slow_m: float = 0.35
+    slow_speed_scale: float = 0.45
+    turn_trigger_clearance_m: float = 0.45
+    min_detour_wz: float = 0.05
     side_commit_weight: float = 2.0
     side_commit_steps: int = 8
     collision_cost: float = 1.0e6
@@ -72,6 +79,7 @@ class MPPIResult:
     candidates: list[MPPITrace] = field(default_factory=list)
     effective_samples: int = 0
     best_cost: float = float("inf")
+    min_clearance_m: float = 0.0
     diagnostics: Dict[str, float] = field(default_factory=dict)
 
 
@@ -128,7 +136,11 @@ class MPPIPlanner:
             # Surface checks are relaxed only while the footprint overlaps the
             # camera blind island; collision/inflation are never relaxed.
             relax = x < self.cfg.start_relax_distance and abs(y) < 0.75
-            chk = checker.check_pose(x, y, yaw, relax_surface=relax)
+            # Unknown is epistemic risk, not a physical obstacle.  It stays
+            # costly below, while geometric/inflated collision remains hard.
+            chk = checker.check_pose(
+                x, y, yaw, relax_surface=relax, unknown_is_soft=True
+            )
             if not chk.valid:
                 return MPPITrace(controls, poses, self.cfg.collision_cost, False, chk.reason)
             cell = planning.grid.xy_to_ij(x, y)
@@ -137,6 +149,7 @@ class MPPIPlanner:
             dist = float(np.hypot(gx - x, gy - y))
             cost += self.cfg.goal_weight * dist * self.cfg.dt
             cost += self.cfg.costmap_weight * float(planning.planning_cost[cell]) * self.cfg.dt
+            cost += self.cfg.unknown_footprint_weight * chk.unknown_fraction * self.cfg.dt
             cost += self.cfg.control_weight * float(np.dot(u, u)) * self.cfg.dt
             cost += self.cfg.smooth_weight * float(np.dot(u - previous, u - previous))
             if self._turn_side_remaining > 0 and self._turn_side and u[2] * self._turn_side < 0.0:
@@ -160,6 +173,17 @@ class MPPIPlanner:
         n, t = max(1, self.cfg.samples), nominal.shape[0]
         noise = self._rng.normal(0.0, [self.cfg.noise_vx, self.cfg.noise_vy, self.cfg.noise_wz],
                                  size=(n, t, 3)).astype(np.float32)
+        # Deterministic fan trajectories ensure both detour sides are always
+        # represented even when Gaussian samples cluster around a warm start.
+        fan = min(n, max(0, int(round(n * self.cfg.exploration_fraction))))
+        if fan:
+            headings = np.linspace(-self.cfg.max_wz, self.cfg.max_wz, fan, dtype=np.float32)
+            fan_start = n - fan
+            noise[fan_start:] = 0.0
+            for i, wz in enumerate(headings):
+                idx = fan_start + i
+                noise[idx, :, 0] = min(self.cfg.max_vx, 0.65 * self.cfg.max_vx) - nominal[:, 0]
+                noise[idx, :, 2] = wz - nominal[:, 2]
         sequences = np.empty_like(noise)
         traces: list[MPPITrace] = []
         costs = np.full(n, self.cfg.collision_cost, np.float64)
@@ -174,7 +198,7 @@ class MPPIPlanner:
             reasons: Dict[str, float] = {"invalid": float(n)}
             for trace in traces:
                 reasons[trace.reason] = reasons.get(trace.reason, 0.0) + 1.0
-            return MPPIResult((0.0, 0.0, 0.0), None, "NO_VALID_TRAJECTORY", traces, 0,
+            return MPPIResult((0.0, 0.0, 0.0), None, "BLOCKED", traces, 0,
                               diagnostics=reasons)
         minimum = float(costs[valid].min())
         weights = np.zeros(n, np.float64)
@@ -182,6 +206,19 @@ class MPPIPlanner:
         weights /= max(weights.sum(), 1e-12)
         self._u = np.tensordot(weights, sequences, axes=(0, 0)).astype(np.float32)
         self._u = self._limit(self._u, velocity)
+        forward_clearance = checker.clearance_at(0.75, 0.0)
+        if (forward_clearance < self.cfg.turn_trigger_clearance_m
+                and abs(float(self._u[0, 2])) < self.cfg.min_detour_wz):
+            detours = [trace for trace in traces if trace.valid
+                       and abs(float(trace.controls[0, 2])) >= self.cfg.min_detour_wz]
+            if self._turn_side:
+                same_side = [trace for trace in detours
+                             if trace.controls[0, 2] * self._turn_side > 0.0]
+                detours = same_side or detours
+            if detours:
+                # MPPI's weighted mean must not average two distinct
+                # left/right homotopies into a straight path at a wall.
+                self._u = min(detours, key=lambda trace: trace.cost).controls.copy()
         if self._turn_side_remaining > 0 and self._turn_side and self._u[0, 2] * self._turn_side < 0.0:
             # Do not reverse yaw in one control tick because a nearly
             # symmetric costmap fluctuated. Zero is safe; later MPPI updates
@@ -201,6 +238,16 @@ class MPPIPlanner:
             self._turn_side_remaining -= 1
         else:
             self._turn_side = 0
-        return MPPIResult(tuple(map(float, self._u[0])), selected, "MPPI", traces,
-                          int(valid.sum()), float(selected.cost),
-                          {"min_sample_cost": minimum, "valid_fraction": float(valid.mean())})
+        min_clearance = min(
+            (checker.clearance_at(float(x), float(y)) for x, y, _ in selected.poses),
+            default=0.0,
+        )
+        command = self._u[0].copy()
+        valid_fraction = float(valid.mean())
+        if (valid_fraction < self.cfg.valid_fraction_slow
+                or min_clearance < self.cfg.clearance_slow_m):
+            command[:2] *= self.cfg.slow_speed_scale
+        return MPPIResult(tuple(map(float, command)), selected, "MPPI", traces,
+                          int(valid.sum()), float(selected.cost), float(min_clearance),
+                          {"min_sample_cost": minimum, "valid_fraction": valid_fraction,
+                           "forward_clearance": forward_clearance})

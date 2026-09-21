@@ -46,6 +46,7 @@ def render_bev_debug(
     goal_xy: Optional[Tuple[float, float]],
     scale: int = 5,
     footprint: Optional[Tuple[float, float]] = None,
+    reference_path: Optional[list[Tuple[float, float]]] = None,
 ) -> np.ndarray:
     """RGB debug image of the BEV, trajectories, goal and robot footprint.
 
@@ -88,6 +89,17 @@ def render_bev_debug(
             draw_path(c.poses, (90, 90, 220) if not c.valid else (120, 180, 255), 1)
         if plan.trajectory is not None and plan.trajectory.v > 0.0:
             draw_path(plan.trajectory.poses, (255, 255, 255), 2)
+    if reference_path and len(reference_path) >= 2:
+        points = []
+        for x, y in reference_path:
+            p = _cell_to_canvas(bev, x, y)
+            if p is not None:
+                points.append((p[0] * scale + scale // 2, p[1] * scale + scale // 2))
+        if len(points) >= 2:
+            # Cyan is the topology-level A* route; white remains MPPI's
+            # selected short-horizon tracking rollout.
+            cv2.polylines(canvas, [np.asarray(points, np.int32)], False,
+                          (40, 255, 255), 2, lineType=cv2.LINE_AA)
 
     robot = _cell_to_canvas(bev, 0.0, 0.0)
     if robot is not None:

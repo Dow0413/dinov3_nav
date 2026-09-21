@@ -10,6 +10,10 @@ dinov3_nav:
     cmd_vel_topic: /cmd_vel
     goal_pose_topic: /goal_pose
     odom_topic: /odom
+    # LiDAR supplies hard geometric obstacles and geometry outside camera FOV.
+    lidar_topic: /local_cloud_map
+    local_map_topic: /local_map
+    local_path_topic: /local_path
 
     ground_mask_topic: /dinov3_nav/ground_mask
     traversable_mask_topic: /dinov3_nav/traversable_mask
@@ -122,6 +126,19 @@ dinov3_nav:
     bev.traversability_threshold: 0.50
     bev.hard_nontrav_threshold: 0.15
     bev.hard_nontrav_min_cells: 3
+
+    # ================= LiDAR rolling geometry map =================
+    # Observations are held in odom then re-rasterized into the current
+    # base_link map. DINO only annotates camera-visible ground traversability.
+    rolling_map.ttl_s: 2.0
+    rolling_map.visual_unknown_value: 0.55
+    lidar.ground_tolerance_m: 0.12
+    lidar.obstacle_height_m: 0.18
+    # Ignore robot chassis/mount/self returns in base_link before they enter
+    # rolling memory. Increase only to cover observed self geometry.
+    lidar.self_filter_radius_m: 0.45
+    astar.lookahead_m: 0.9
+    mapping.use_lidar: true
     # Short-horizon motion-compensated temporal fusion in base_link.  Previous
     # evidence is transformed through odom, decayed, then fused with raw BEV.
     bev.temporal_enable: true
@@ -171,6 +188,25 @@ dinov3_nav:
     # Unknown support inside this forward near-field is expected due to the
     # camera blind zone. Collision with inflated obstacles remains forbidden.
     mppi.start_relax_distance: 0.90
+    # Unknown is a soft risk, never a collision. Geometric obstacle and
+    # footprint-inflation checks remain hard constraints.
+    mppi.unknown_footprint_weight: 2.0
+    # Reserve deterministic left/right turning fans so warm starts do not
+    # eliminate a viable detour branch.
+    mppi.exploration_fraction: 0.35
+    # Brake for scarce feasible rollouts or low clearance. valid==0 enters
+    # BLOCKED and publishes zero velocity.
+    mppi.valid_fraction_slow: 0.12
+    mppi.clearance_slow_m: 0.35
+    mppi.slow_speed_scale: 0.45
+    # Far goals are projected to a robot-centric terminal inside local BEV.
+    mppi.local_goal_distance: 2.0
+    mppi.turn_trigger_clearance_m: 0.45
+    mppi.min_detour_wz: 0.05
+    # Costmap production is tied to DINO; MPPI consumes the latest completed
+    # costmap independently at this rate, while cmd_vel is published at
+    # control.cmd_rate.
+    mppi.replan_rate: 5.0
     mppi.goal_weight: 5.0
     mppi.terminal_goal_weight: 10.0
     mppi.heading_weight: 0.8
