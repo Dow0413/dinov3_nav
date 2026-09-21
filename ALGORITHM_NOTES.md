@@ -30,6 +30,12 @@ Registered depth is back-projected with CameraInfo intrinsics and camera TF. Poi
 
 A short yaw-side commitment regulariser prevents immediate sign reversal when nearly symmetric visual geometry fluctuates. It never accepts collision: every sequence remains footprint checked, and a reverse is only delayed with zero yaw until commitment expires.
 
+The command timer executes the selected MPPI **sequence** at its configured
+`mppi.dt`; it does not repeat the first `(vx, vy, wz)` while the next DINOv3
+frame is running.  If no new collision-checked BEV arrives after that sequence
+ends, the node stops.  This prevents a stale nonzero `wz` from turning the
+robot in place during slow perception.
+
 `mppi.max_vy` defaults to zero for a differential-drive base. Set it nonzero only when the downstream controller genuinely supports `Twist.linear.y`.
 
 ## Topics

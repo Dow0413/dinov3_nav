@@ -10,10 +10,6 @@ dinov3_nav:
     cmd_vel_topic: /cmd_vel
     goal_pose_topic: /goal_pose
     odom_topic: /odom
-    # LiDAR supplies hard geometric obstacles and geometry outside camera FOV.
-    lidar_topic: /local_cloud_map
-    local_map_topic: /local_map
-    local_path_topic: /local_path
 
     ground_mask_topic: /dinov3_nav/ground_mask
     traversable_mask_topic: /dinov3_nav/traversable_mask
@@ -38,6 +34,13 @@ dinov3_nav:
     # Global goal frame (PoseStamped without frame_id is assumed to be here).
     global.default_goal_frame: odom
 
+    # Match ground_seg/main.py's fast RGB-only segmentation path. Depth is
+    # still used below for metric BEV projection and obstacle height checks.
+    segmentation.use_depth_fusion: false
+    # Load model weights and execute first CUDA kernels before the node accepts
+    # camera frames. Startup takes longer, but the first real image is timely.
+    perception.preload: true
+
     # Camera frame for TF lookup. Empty -> use CameraInfo.header.frame_id
     # (zed_camera_link in the Gazebo sim; the sim's rl_nav_controller or
     # enable_zed_static_tf publishes base_link <- zed_camera_link).
@@ -56,7 +59,10 @@ dinov3_nav:
     # frame is base_link.
     robot.length: 0.65
     robot.width: 0.6
-    robot.safety_margin: 0.1
+    # Extra collision clearance beyond the measured rectangular body.  Keep
+    # this at 0.18 m while validating in Gazebo; reduce only after verifying
+    # the depth/BEV alignment against the real robot.
+    robot.safety_margin: 0.18
     robot.center_x: 0.0
     robot.center_y: 0.0
     robot.footprint_sample_step: 0.05
@@ -75,7 +81,10 @@ dinov3_nav:
     # ================= DINOv3 ground_seg =================
     ckpt: /home/dow/DOW/dinov3/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
     resolution: 448
-    device: auto
+    # The project venv has verified CUDA access on the RTX 5060 Ti.  Keep this
+    # explicit so a launch-environment mismatch fails loudly instead of
+    # silently falling back to CPU and creating stale camera plans.
+    device: cuda
     seed_rows_frac: 0.10
     seed_cols_frac: 0.60
     threshold: otsu
@@ -118,27 +127,14 @@ dinov3_nav:
     bev.min_ground_z_points: 200
     # Fail-safe: stop if less than this fraction of BEV cells is observed.
     bev.min_observed_fraction: 0.05
-    # Sparse RGB-D ground hits are connected only along sampled rays whose
-    # endpoints are already DINO+geometry ground; occluded space stays unknown.
-    bev.visibility_raycast: true
+    # Do not synthesize a triangular free-space fan from sparse ground rays.
+    # Only measured RGB-D support (and small-hole closing) is traversable.
+    bev.visibility_raycast: false
     bev.visibility_raycast_stride_px: 8
     # Continuous traversability thresholds for the footprint checker.
     bev.traversability_threshold: 0.50
     bev.hard_nontrav_threshold: 0.15
     bev.hard_nontrav_min_cells: 3
-
-    # ================= LiDAR rolling geometry map =================
-    # Observations are held in odom then re-rasterized into the current
-    # base_link map. DINO only annotates camera-visible ground traversability.
-    rolling_map.ttl_s: 2.0
-    rolling_map.visual_unknown_value: 0.55
-    lidar.ground_tolerance_m: 0.12
-    lidar.obstacle_height_m: 0.18
-    # Ignore robot chassis/mount/self returns in base_link before they enter
-    # rolling memory. Increase only to cover observed self geometry.
-    lidar.self_filter_radius_m: 0.45
-    astar.lookahead_m: 0.9
-    mapping.use_lidar: true
     # Short-horizon motion-compensated temporal fusion in base_link.  Previous
     # evidence is transformed through odom, decayed, then fused with raw BEV.
     bev.temporal_enable: true
@@ -153,7 +149,10 @@ dinov3_nav:
     # Only weak one-cell temporal fragments are dropped; geometric hard hits
     # remain intact and are never removed by ego clearing.
     bev.cleanup_min_obstacle_cells: 2
-    bev.ego_clear_radius_m: 0.30
+    # Do not synthesize a circular free-space island at the robot. MPPI's
+    # near-field relaxation handles the camera blind zone without modifying
+    # the observed BEV.
+    bev.ego_clear_radius_m: 0.0
     bev.ego_clear_traversability: 0.80
 
     # ================= Planning costmap =================
@@ -169,7 +168,10 @@ dinov3_nav:
     # Each update samples and rolls out full (vx, vy, wz) control sequences
     # through the inflated robot-centric costmap. It never chooses a steering
     # direction directly from the current image mask.
-    mppi.horizon_steps: 24
+    # 3.0 s of time-indexed controls covers the normal DINO inference gap.
+    # The timer executes each 0.1 s entry once; it never repeats the final
+    # angular command after this horizon.
+    mppi.horizon_steps: 30
     mppi.dt: 0.10
     mppi.samples: 384
     mppi.temperature: 1.0
@@ -177,43 +179,37 @@ dinov3_nav:
     mppi.noise_vy: 0.08
     mppi.noise_wz: 0.55
     mppi.min_vx: -0.10
-    mppi.max_vx: 0.40
+    # Raise the forward-speed envelope from 0.40 to 0.80 m/s.  Keep this
+    # aligned with the nominal MPPI forward prior in mppi.py.
+    mppi.max_vx: 0.80
+    mppi.nominal_vx: 0.40
     # Differential-drive default. Set nonzero only if the downstream base
     # controller genuinely supports Twist.linear.y.
     mppi.max_vy: 0.0
     mppi.max_wz: 1.20
     mppi.max_accel_vx: 4.00
-    mppi.max_accel_vy: 0.50
-    mppi.max_accel_wz: 6.00
+    mppi.max_accel_vy: 3.00
+    mppi.max_accel_wz: 4.00
     # Unknown support inside this forward near-field is expected due to the
     # camera blind zone. Collision with inflated obstacles remains forbidden.
     mppi.start_relax_distance: 0.90
-    # Unknown is a soft risk, never a collision. Geometric obstacle and
-    # footprint-inflation checks remain hard constraints.
-    mppi.unknown_footprint_weight: 2.0
-    # Reserve deterministic left/right turning fans so warm starts do not
-    # eliminate a viable detour branch.
-    mppi.exploration_fraction: 0.35
-    # Brake for scarce feasible rollouts or low clearance. valid==0 enters
-    # BLOCKED and publishes zero velocity.
-    mppi.valid_fraction_slow: 0.12
-    mppi.clearance_slow_m: 0.35
-    mppi.slow_speed_scale: 0.45
-    # Far goals are projected to a robot-centric terminal inside local BEV.
-    mppi.local_goal_distance: 2.0
-    mppi.turn_trigger_clearance_m: 0.45
-    mppi.min_detour_wz: 0.05
-    # Costmap production is tied to DINO; MPPI consumes the latest completed
-    # costmap independently at this rate, while cmd_vel is published at
-    # control.cmd_rate.
-    mppi.replan_rate: 5.0
     mppi.goal_weight: 5.0
     mppi.terminal_goal_weight: 10.0
     mppi.heading_weight: 0.8
     mppi.costmap_weight: 1.0
     mppi.control_weight: 0.08
     mppi.smooth_weight: 0.35
+    # Prevent small sampling asymmetries from accumulating into a circle
+    # when the goal corridor is otherwise straight and collision-free.
+    mppi.angular_deadband: 0.04
+    # Keep one chosen detour side briefly so symmetric obstacle evidence does
+    # not make the robot alternate left and right on consecutive replans.
+    mppi.side_commit_steps: 8
     mppi.seed: 7
+    # A safe cached sequence is checked against every fresh BEV. Zero disables
+    # time-driven sampling: full MPPI runs only for a new goal or when new BEV
+    # evidence invalidates the cached path.
+    mppi.replan_max_age: 0.0
 
     # ================= Control / global target =================
     # SAFETY: control stays off until TF + CameraInfo + projection sanity
@@ -225,14 +221,19 @@ dinov3_nav:
     control.angular_gain: 1.5
     control.turn_in_place_angle_deg: 43.0
     control.cmd_rate: 10.0
-    control.watchdog: 1.5
+    # DINOv3 takes roughly 0.5--2.5 s per camera image on this system.  Hold
+    # the last trajectory only while its BEV collision check is this recent;
+    # the command timer still publishes it continuously at control.cmd_rate.
+    # Reducing this is safer for fast dynamic obstacles but reintroduces
+    # pauses when inference takes longer than the limit.
+    control.max_bev_age: 3.5
     control.goal_tolerance: 0.35
 
     global.enable: true
 
     # ================= Runtime / saved debug images =================
     process_period: 0.10
-    output.enable: true
+    output.enable: false
     output.dir: ""
     output.save_every: 5
 
@@ -244,6 +245,9 @@ dinov3_nav:
     debug.window_name: DINOv3_MPPI_BEV
     debug.window_scale: 1.0
     debug.window_rate_hz: 20.0
+    # Temporary performance diagnosis: logs DINO/depth/BEV/MPPI timings for
+    # each processed frame. Set false again after collecting the measurements.
+    debug.profile_timing: true
     # This project venv uses an OpenCV wheel without HighGUI. Tk/Pillow shows
     # the same RGB BEV window without needing to rebuild OpenCV. "auto" tries
     # OpenCV then Tk; "opencv" forces HighGUI when a GUI-enabled cv2 is used.

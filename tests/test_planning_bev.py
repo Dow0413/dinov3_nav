@@ -18,7 +18,6 @@ from dinov3_nav.debug_viz import (
 from dinov3_nav.footprint import FootprintConfig
 from dinov3_nav.planning_bev import (
     PlanningCostConfig,
-    MetricTemporalBEVFusion,
     TemporalBEVConfig,
     TemporalBEVFusion,
     build_planning_bev,
@@ -63,22 +62,6 @@ def test_temporal_obstacle_persists_and_reprojects():
     shifted = second.xy_to_ij(0.8, 0.0)
     assert shifted is not None and second.obstacle[shifted], "obstacle was not motion-compensated"
     print("temporal persistence/reprojection: OK")
-
-
-def test_metric_memory_rerasterizes_observations_in_current_base_frame():
-    memory = MetricTemporalBEVFusion(TemporalBEVConfig(
-        evidence_half_life_s=2.0, obstacle_evidence_threshold=1.25,
-    ))
-    # First observation is stored in a fixed metric frame at x=1.0.
-    first = memory.update(raw_grid([(1.0, 0.0)]), 0.0, np.eye(4, dtype=np.float32))
-    assert first.obstacle[first.xy_to_ij(1.0, 0.0)]
-    # Robot moves +0.2m in the fixed frame. Re-rasterization must place the
-    # same obstacle at x=0.8 in the new robot-centred grid.
-    T_odom_from_base = np.eye(4, dtype=np.float32)
-    T_odom_from_base[0, 3] = .2
-    second = memory.update(raw_grid(observed=False), .1, T_odom_from_base)
-    cell = second.xy_to_ij(.8, 0.0)
-    assert cell is not None and second.obstacle[cell]
 
 
 def test_unknown_and_ego_clearing_semantics():

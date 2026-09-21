@@ -20,7 +20,7 @@ from .planning_bev import PlanningBEV
 
 @dataclass
 class MPPIConfig:
-    horizon_steps: int = 24
+    horizon_steps: int = 30
     dt: float = 0.10
     samples: int = 384
     temperature: float = 1.0
@@ -29,6 +29,7 @@ class MPPIConfig:
     noise_wz: float = 0.55
     max_vx: float = 0.40
     min_vx: float = -0.10
+    nominal_vx: float = 0.20
     max_vy: float = 0.0
     max_wz: float = 1.20
     max_accel_vx: float = 0.60
@@ -44,13 +45,10 @@ class MPPIConfig:
     costmap_weight: float = 1.0
     control_weight: float = 0.08
     smooth_weight: float = 0.35
-    unknown_footprint_weight: float = 2.0
-    exploration_fraction: float = 0.35
-    valid_fraction_slow: float = 0.12
-    clearance_slow_m: float = 0.35
-    slow_speed_scale: float = 0.45
-    turn_trigger_clearance_m: float = 0.45
-    min_detour_wz: float = 0.05
+    # Suppress tiny stochastic yaw commands in an otherwise clear corridor.
+    # Without this, a small random MPPI bias can accumulate into a visible
+    # circle even when the goal is straight ahead.
+    angular_deadband: float = 0.04
     side_commit_weight: float = 2.0
     side_commit_steps: int = 8
     collision_cost: float = 1.0e6
@@ -79,7 +77,6 @@ class MPPIResult:
     candidates: list[MPPITrace] = field(default_factory=list)
     effective_samples: int = 0
     best_cost: float = float("inf")
-    min_clearance_m: float = 0.0
     diagnostics: Dict[str, float] = field(default_factory=dict)
 
 
@@ -96,13 +93,49 @@ class MPPIPlanner:
         self._turn_side = 0
         self._turn_side_remaining = 0
 
-    def _warm_start(self) -> np.ndarray:
+    def reuse_if_safe(
+        self,
+        planning: PlanningBEV,
+        checker: FootprintChecker,
+        goal_xy: Tuple[float, float],
+        current_velocity: Tuple[float, float, float],
+        elapsed_steps: int = 1,
+    ) -> Optional[MPPITrace]:
+        """Advance the previous control sequence when it remains safe.
+
+        This is the inexpensive receding-horizon path: a new BEV still
+        validates the complete remaining trajectory, but no random rollout
+        batch is generated unless that validation fails.  It therefore reacts
+        immediately when a newly visible obstacle intersects the cached path
+        while avoiding redundant MPPI sampling in open space.
+        """
+        if self._u is None:
+            return None
+        steps = max(1, int(elapsed_steps))
+        if steps >= len(self._u):
+            return None
+        controls = self._u.copy()
+        controls[:-steps] = controls[steps:]
+        controls[-steps:] = controls[-steps - 1]
+        velocity = np.asarray(current_velocity, np.float32)
+        controls = self._limit(controls, velocity)
+        trace = self._rollout_cost(controls, velocity, planning, checker, goal_xy)
+        if not trace.valid:
+            return None
+        self._u = controls
+        return trace
+
+    def _warm_start(self, elapsed_steps: int = 1) -> np.ndarray:
         n = max(2, int(self.cfg.horizon_steps))
         if self._u is None or self._u.shape != (n, 3):
             self._u = np.zeros((n, 3), np.float32)
         else:
-            self._u[:-1] = self._u[1:]
-            self._u[-1] = self._u[-2]
+            steps = max(1, int(elapsed_steps))
+            if steps >= n:
+                self._u.fill(0.0)
+            else:
+                self._u[:-steps] = self._u[steps:]
+                self._u[-steps:] = self._u[-steps - 1]
         return self._u.copy()
 
     def _limit(self, controls: np.ndarray, initial_velocity: np.ndarray) -> np.ndarray:
@@ -117,6 +150,157 @@ class MPPIPlanner:
             c[k] = np.clip(c[k], previous - limits, previous + limits)
             previous = c[k]
         return c
+
+    def _limit_batch(self, controls: np.ndarray, initial_velocity: np.ndarray) -> np.ndarray:
+        """Apply velocity and acceleration limits to ``[samples, horizon, 3]``.
+
+        The former implementation called :meth:`_limit` once per sampled
+        trajectory.  That was correct but made Python execute thousands of
+        tiny array operations for every camera frame.  Limits at each horizon
+        step are independent across trajectories, so they can be applied in
+        one batched operation.
+        """
+        c = controls.copy()
+        c[..., 0] = np.clip(c[..., 0], self.cfg.min_vx, self.cfg.max_vx)
+        c[..., 1] = np.clip(c[..., 1], -self.cfg.max_vy, self.cfg.max_vy)
+        c[..., 2] = np.clip(c[..., 2], -self.cfg.max_wz, self.cfg.max_wz)
+        previous = np.broadcast_to(initial_velocity.astype(np.float32), (len(c), 3)).copy()
+        limits = np.array(
+            [self.cfg.max_accel_vx, self.cfg.max_accel_vy, self.cfg.max_accel_wz],
+            np.float32,
+        ) * self.cfg.dt
+        for k in range(c.shape[1]):
+            c[:, k] = np.clip(c[:, k], previous - limits, previous + limits)
+            previous = c[:, k]
+        return c
+
+    def _rollout_batch(
+        self,
+        controls: np.ndarray,
+        initial_velocity: np.ndarray,
+        planning: PlanningBEV,
+        checker: FootprintChecker,
+        goal_xy: Tuple[float, float],
+    ) -> list[MPPITrace]:
+        """Score all sampled trajectories with vectorized footprint checks.
+
+        Collision, unknown-surface, and costmap rules are identical to
+        :meth:`_rollout_cost`.  Only the execution layout changes: one NumPy
+        operation handles all rollouts at a horizon step instead of entering
+        Python once per pose.  This keeps the safety model intact while making
+        the controller practical on CPU-only robots.
+        """
+        samples, steps, _ = controls.shape
+        poses = np.zeros((samples, steps + 1, 3), np.float32)
+        costs = np.zeros(samples, np.float64)
+        alive = np.ones(samples, bool)
+        reasons = np.full(samples, "ok", dtype=object)
+        x = np.zeros(samples, np.float32)
+        y = np.zeros(samples, np.float32)
+        yaw = np.zeros(samples, np.float32)
+        previous = np.broadcast_to(initial_velocity.astype(np.float32), (samples, 3))
+
+        body = checker._body_points
+        bx, by = body[:, 0], body[:, 1]
+        nx, ny = planning.grid.shape
+        resolution = planning.grid.cfg.resolution
+        x_min, y_min = planning.grid.cfg.x_min, planning.grid.cfg.y_min
+        blocked = checker.layers.inflated_hard_blocked
+        observed = planning.grid.observed
+        traversability = planning.grid.traversability
+        costmap = planning.planning_cost
+        cfg = checker.cfg
+        gx, gy = goal_xy
+
+        def reject(mask: np.ndarray, reason: str) -> None:
+            newly_invalid = alive & mask
+            reasons[newly_invalid] = reason
+            alive[newly_invalid] = False
+
+        for k in range(steps):
+            u = controls[:, k]
+            yaw_mid = yaw + 0.5 * u[:, 2] * self.cfg.dt
+            c, s = np.cos(yaw_mid), np.sin(yaw_mid)
+            x += (u[:, 0] * c - u[:, 1] * s) * self.cfg.dt
+            y += (u[:, 0] * s + u[:, 1] * c) * self.cfg.dt
+            yaw += u[:, 2] * self.cfg.dt
+            poses[:, k + 1] = np.stack((x, y, yaw), axis=1)
+
+            # One [samples, footprint_points] index computation replaces a
+            # FootprintChecker.check_pose call for every rollout pose.
+            wx = x[:, None] + c[:, None] * bx - s[:, None] * by
+            wy = y[:, None] + s[:, None] * bx + c[:, None] * by
+            ii = ((wx - x_min) / resolution).astype(np.int32)
+            jj = ((wy - y_min) / resolution).astype(np.int32)
+            inside = (ii >= 0) & (ii < nx) & (jj >= 0) & (jj < ny)
+            reject(~inside.all(axis=1), "out_of_bounds")
+
+            # Clip only for safe array gathering; rows that were outside are
+            # already invalid and never contribute cost below.
+            ii = np.clip(ii, 0, nx - 1)
+            jj = np.clip(jj, 0, ny - 1)
+            reject(blocked[ii, jj].any(axis=1), "collision")
+
+            relax = (x < self.cfg.start_relax_distance) & (np.abs(y) < 0.75)
+            need_surface = alive & ~relax
+            footprint_observed = observed[ii, jj]
+            unknown_fraction = (~footprint_observed).mean(axis=1)
+            reject(need_surface & (unknown_fraction > cfg.max_unknown_fraction), "unknown")
+
+            active_surface = alive & ~relax
+            observed_count = footprint_observed.sum(axis=1)
+            reject(active_surface & (observed_count == 0), "unknown")
+            # Aggregate over observed cells without ragged indexing.
+            observed_float = footprint_observed.astype(np.float32)
+            trav = traversability[ii, jj]
+            denom = np.maximum(observed_count, 1)
+            ground_fraction = ((trav >= cfg.traversability_threshold) * observed_float).sum(axis=1) / denom
+            mean_trav = (trav * observed_float).sum(axis=1) / denom
+            reject(
+                active_surface
+                & ((ground_fraction < cfg.min_ground_fraction) | (mean_trav < cfg.min_mean_traversability)),
+                "not_traversable",
+            )
+
+            ci = ((x - x_min) / resolution).astype(np.int32)
+            cj = ((y - y_min) / resolution).astype(np.int32)
+            cell_inside = (ci >= 0) & (ci < nx) & (cj >= 0) & (cj < ny)
+            reject(~cell_inside, "costmap")
+            ci = np.clip(ci, 0, nx - 1)
+            cj = np.clip(cj, 0, ny - 1)
+            cell_cost = costmap[ci, cj]
+            reject(~np.isfinite(cell_cost), "costmap")
+
+            valid_now = alive
+            distance = np.hypot(gx - x, gy - y)
+            smooth = np.sum((u - previous) ** 2, axis=1)
+            step_cost = (
+                self.cfg.goal_weight * distance * self.cfg.dt
+                + self.cfg.costmap_weight * cell_cost * self.cfg.dt
+                + self.cfg.control_weight * np.sum(u * u, axis=1) * self.cfg.dt
+                + self.cfg.smooth_weight * smooth
+            )
+            if self._turn_side_remaining > 0 and self._turn_side:
+                step_cost += (
+                    self.cfg.side_commit_weight
+                    * np.maximum(0.0, -u[:, 2] * self._turn_side)
+                    * self.cfg.dt
+                )
+            costs[valid_now] += step_cost[valid_now]
+            previous = u
+
+        terminal_distance = np.hypot(gx - x, gy - y)
+        desired = np.arctan2(gy - y, gx - x)
+        heading_error = (desired - yaw + np.pi) % (2.0 * np.pi) - np.pi
+        costs[alive] += (
+            self.cfg.terminal_goal_weight * terminal_distance[alive]
+            + self.cfg.heading_weight * heading_error[alive] ** 2
+        )
+        costs[~alive] = self.cfg.collision_cost
+        return [
+            MPPITrace(controls[i], poses[i], float(costs[i]), bool(alive[i]), str(reasons[i]))
+            for i in range(samples)
+        ]
 
     def _rollout_cost(self, controls: np.ndarray, initial_velocity: np.ndarray,
                       planning: PlanningBEV, checker: FootprintChecker,
@@ -136,11 +320,7 @@ class MPPIPlanner:
             # Surface checks are relaxed only while the footprint overlaps the
             # camera blind island; collision/inflation are never relaxed.
             relax = x < self.cfg.start_relax_distance and abs(y) < 0.75
-            # Unknown is epistemic risk, not a physical obstacle.  It stays
-            # costly below, while geometric/inflated collision remains hard.
-            chk = checker.check_pose(
-                x, y, yaw, relax_surface=relax, unknown_is_soft=True
-            )
+            chk = checker.check_pose(x, y, yaw, relax_surface=relax)
             if not chk.valid:
                 return MPPITrace(controls, poses, self.cfg.collision_cost, False, chk.reason)
             cell = planning.grid.xy_to_ij(x, y)
@@ -149,7 +329,6 @@ class MPPIPlanner:
             dist = float(np.hypot(gx - x, gy - y))
             cost += self.cfg.goal_weight * dist * self.cfg.dt
             cost += self.cfg.costmap_weight * float(planning.planning_cost[cell]) * self.cfg.dt
-            cost += self.cfg.unknown_footprint_weight * chk.unknown_fraction * self.cfg.dt
             cost += self.cfg.control_weight * float(np.dot(u, u)) * self.cfg.dt
             cost += self.cfg.smooth_weight * float(np.dot(u - previous, u - previous))
             if self._turn_side_remaining > 0 and self._turn_side and u[2] * self._turn_side < 0.0:
@@ -163,42 +342,34 @@ class MPPIPlanner:
         cost += self.cfg.heading_weight * heading_error * heading_error
         return MPPITrace(controls, poses, cost, True)
 
-    def plan(self, planning: PlanningBEV, checker: FootprintChecker,
-             goal_xy: Tuple[float, float], current_velocity: Tuple[float, float, float]) -> MPPIResult:
+    def plan(
+        self,
+        planning: PlanningBEV,
+        checker: FootprintChecker,
+        goal_xy: Tuple[float, float],
+        current_velocity: Tuple[float, float, float],
+        elapsed_steps: int = 1,
+    ) -> MPPIResult:
         velocity = np.asarray(current_velocity, np.float32)
-        nominal = self._warm_start()
+        nominal = self._warm_start(elapsed_steps)
         # Add a gentle forward prior; obstacle avoidance is still entirely
         # trajectory-cost driven, not a left/right image-space decision.
-        nominal[:, 0] = np.maximum(nominal[:, 0], min(0.20, self.cfg.max_vx))
+        nominal[:, 0] = np.maximum(
+            nominal[:, 0], min(self.cfg.nominal_vx, self.cfg.max_vx)
+        )
         n, t = max(1, self.cfg.samples), nominal.shape[0]
         noise = self._rng.normal(0.0, [self.cfg.noise_vx, self.cfg.noise_vy, self.cfg.noise_wz],
                                  size=(n, t, 3)).astype(np.float32)
-        # Deterministic fan trajectories ensure both detour sides are always
-        # represented even when Gaussian samples cluster around a warm start.
-        fan = min(n, max(0, int(round(n * self.cfg.exploration_fraction))))
-        if fan:
-            headings = np.linspace(-self.cfg.max_wz, self.cfg.max_wz, fan, dtype=np.float32)
-            fan_start = n - fan
-            noise[fan_start:] = 0.0
-            for i, wz in enumerate(headings):
-                idx = fan_start + i
-                noise[idx, :, 0] = min(self.cfg.max_vx, 0.65 * self.cfg.max_vx) - nominal[:, 0]
-                noise[idx, :, 2] = wz - nominal[:, 2]
-        sequences = np.empty_like(noise)
-        traces: list[MPPITrace] = []
-        costs = np.full(n, self.cfg.collision_cost, np.float64)
-        for i in range(n):
-            sequences[i] = self._limit(nominal + noise[i], velocity)
-            trace = self._rollout_cost(sequences[i], velocity, planning, checker, goal_xy)
-            traces.append(trace)
-            costs[i] = trace.cost
+        sequences = self._limit_batch(nominal[None, :, :] + noise, velocity)
+        traces = self._rollout_batch(sequences, velocity, planning, checker, goal_xy)
+        costs = np.asarray([trace.cost for trace in traces], np.float64)
         valid = np.array([x.valid for x in traces], bool)
         if not valid.any():
             self._u = np.zeros_like(nominal)
             reasons: Dict[str, float] = {"invalid": float(n)}
             for trace in traces:
                 reasons[trace.reason] = reasons.get(trace.reason, 0.0) + 1.0
-            return MPPIResult((0.0, 0.0, 0.0), None, "BLOCKED", traces, 0,
+            return MPPIResult((0.0, 0.0, 0.0), None, "NO_VALID_TRAJECTORY", traces, 0,
                               diagnostics=reasons)
         minimum = float(costs[valid].min())
         weights = np.zeros(n, np.float64)
@@ -206,19 +377,18 @@ class MPPIPlanner:
         weights /= max(weights.sum(), 1e-12)
         self._u = np.tensordot(weights, sequences, axes=(0, 0)).astype(np.float32)
         self._u = self._limit(self._u, velocity)
-        forward_clearance = checker.clearance_at(0.75, 0.0)
-        if (forward_clearance < self.cfg.turn_trigger_clearance_m
-                and abs(float(self._u[0, 2])) < self.cfg.min_detour_wz):
-            detours = [trace for trace in traces if trace.valid
-                       and abs(float(trace.controls[0, 2])) >= self.cfg.min_detour_wz]
-            if self._turn_side:
-                same_side = [trace for trace in detours
-                             if trace.controls[0, 2] * self._turn_side > 0.0]
-                detours = same_side or detours
-            if detours:
-                # MPPI's weighted mean must not average two distinct
-                # left/right homotopies into a straight path at a wall.
-                self._u = min(detours, key=lambda trace: trace.cost).controls.copy()
+        deadband = max(0.0, float(self.cfg.angular_deadband))
+        if deadband and abs(float(self._u[0, 2])) < deadband:
+            # A tiny random yaw component is only suppressed when the
+            # resulting straightened *whole trajectory* remains valid.  A
+            # mild initial turn can be essential to clear a nearby obstacle,
+            # so deadbanding a command without this collision check is unsafe.
+            straightened = self._u.copy()
+            straightened[np.abs(straightened[:, 2]) < deadband, 2] = 0.0
+            if self._rollout_cost(
+                straightened, velocity, planning, checker, goal_xy
+            ).valid:
+                self._u = straightened
         if self._turn_side_remaining > 0 and self._turn_side and self._u[0, 2] * self._turn_side < 0.0:
             # Do not reverse yaw in one control tick because a nearly
             # symmetric costmap fluctuated. Zero is safe; later MPPI updates
@@ -238,16 +408,6 @@ class MPPIPlanner:
             self._turn_side_remaining -= 1
         else:
             self._turn_side = 0
-        min_clearance = min(
-            (checker.clearance_at(float(x), float(y)) for x, y, _ in selected.poses),
-            default=0.0,
-        )
-        command = self._u[0].copy()
-        valid_fraction = float(valid.mean())
-        if (valid_fraction < self.cfg.valid_fraction_slow
-                or min_clearance < self.cfg.clearance_slow_m):
-            command[:2] *= self.cfg.slow_speed_scale
-        return MPPIResult(tuple(map(float, command)), selected, "MPPI", traces,
-                          int(valid.sum()), float(selected.cost), float(min_clearance),
-                          {"min_sample_cost": minimum, "valid_fraction": valid_fraction,
-                           "forward_clearance": forward_clearance})
+        return MPPIResult(tuple(map(float, self._u[0])), selected, "MPPI", traces,
+                          int(valid.sum()), float(selected.cost),
+                          {"min_sample_cost": minimum, "valid_fraction": float(valid.mean())})

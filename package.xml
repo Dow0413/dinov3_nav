@@ -3,12 +3,15 @@
 <package format="3">
   <name>dinov3_nav</name>
   <version>0.4.0</version>
-  <description>DINOv3 RGB-D traversability navigation: base_link metric costmap and footprint-safe MPPI rollout control.</description>
+  <description>DINOv3 RGB-D traversability navigation with a base_link costmap and footprint-safe MPPI local control.</description>
 
   <maintainer email="dow@todo.todo">dow</maintainer>
   <license>MIT</license>
 
-  <!-- torch / DINOv3 / ground_seg / SAM2 are supplied by the project venv. -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- DINOv3, PyTorch, ground_seg, and optional SAM2 are supplied by the
+       project virtual environment rather than rosdep packages. -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
@@ -20,6 +23,8 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>image_view</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

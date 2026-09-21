@@ -72,3 +72,31 @@ def test_warm_start_suppresses_left_right_flipping():
         signs.append(np.sign(result.command[2]))
     nonzero = [s for s in signs if s]
     assert nonzero and len(set(nonzero)) == 1, signs
+
+
+def test_safe_cached_trajectory_is_reused_but_new_wall_triggers_replan():
+    open_map, open_checker = make_map()
+    local = planner()
+    first = local.plan(open_map, open_checker, (3.0, 0.0), (0.0, 0.0, 0.0))
+    assert first.trajectory and first.trajectory.valid
+
+    reused = local.reuse_if_safe(open_map, open_checker, (3.0, 0.0), first.command)
+    assert reused and reused.valid
+
+    blocked_map, blocked_checker = make_map([(0.30, -0.8, 2.0, 0.8)])
+    assert local.reuse_if_safe(
+        blocked_map, blocked_checker, (3.0, 0.0), first.command
+    ) is None
+
+
+def test_reuse_advances_by_elapsed_control_time_not_one_image_frame():
+    planning, checker = make_map()
+    local = planner()
+    first = local.plan(planning, checker, (3.0, 0.0), (0.0, 0.0, 0.0))
+    assert first.trajectory and first.trajectory.valid
+    original = first.trajectory.controls.copy()
+    reused = local.reuse_if_safe(
+        planning, checker, (3.0, 0.0), first.command, elapsed_steps=5
+    )
+    assert reused and reused.valid
+    np.testing.assert_allclose(reused.controls[0], original[5])

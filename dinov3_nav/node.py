@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 import threading
+import os
 from array import array
 from math import hypot
 from pathlib import Path
@@ -28,18 +29,19 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry, OccupancyGrid, Path as NavPath
+from nav_msgs.msg import Odometry
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32, String
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -60,12 +62,9 @@ from .footprint import (
     FootprintChecker,
 )
 from .mppi import MPPIConfig, MPPIPlanner, MPPIResult
-from .astar import AStarLocalPlanner
-from .rolling_map import RollingLocalMap, RollingMapConfig
 from .planning_bev import (
     PlanningCostConfig,
     PlanningBEV,
-    MetricTemporalBEVFusion,
     TemporalBEVConfig,
     TemporalBEVFusion,
     build_planning_bev,
@@ -161,6 +160,10 @@ class Dinov3NavNode(Node):
             seed_cols_frac=p["seed_cols_frac"],
             threshold=p["threshold"],
         )
+        # Depth remains mandatory for BEV geometry.  Its optional use inside
+        # the DINO segmentation head is separately configurable, matching the
+        # fast RGB-only path in ground_seg/main.py when disabled.
+        self._gseg_depth_fusion = bool(p["segmentation.use_depth_fusion"])
         self._sam2: Optional[SAM2MaskRefiner] = None
         self._sam2_max_expand_px = max(0, int(p["sam2.max_expand_px"]))
         if p["sam2.enable"]:
@@ -170,6 +173,8 @@ class Dinov3NavNode(Node):
                 )
             except Exception as exc:
                 self.get_logger().warning(f"SAM2 unavailable; using DINO mask: {exc}")
+        if p["perception.preload"]:
+            self._warmup_perception()
 
         self._stairs = None
         if p["stairs.enable"]:
@@ -211,6 +216,14 @@ class Dinov3NavNode(Node):
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        # Local planning is useful only for the newest camera observation.
+        # Keep one best-effort image per topic so a slow inference/planning
+        # cycle cannot build a seconds-old RGB-D backlog.
+        self._image_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
 
         # ----------------------------- BEV / footprint / MPPI planner
         self._bev_cfg = BEVConfig(
@@ -233,17 +246,6 @@ class Dinov3NavNode(Node):
             visibility_raycast_stride_px=int(p["bev.visibility_raycast_stride_px"]),
         )
         self._min_observed_fraction = float(p["bev.min_observed_fraction"])
-        self._rolling_map = RollingLocalMap(self._bev_cfg, RollingMapConfig(
-            ttl_s=float(p["rolling_map.ttl_s"]),
-            ground_tolerance_m=float(p["lidar.ground_tolerance_m"]),
-            obstacle_height_m=float(p["lidar.obstacle_height_m"]),
-            visual_unknown_value=float(p["rolling_map.visual_unknown_value"]),
-            self_filter_radius_m=float(p["lidar.self_filter_radius_m"]),
-        ))
-        self._astar = AStarLocalPlanner()
-        self._astar_lookahead = float(p["astar.lookahead_m"])
-        self._use_lidar_mapping = bool(p["mapping.use_lidar"])
-        self._latest_visual = None
         # MPPI checks the full rectangular footprint at every rollout pose.
         # Therefore this inflation is only the requested extra clearance;
         # adding half-width here would double-count the body geometry.
@@ -258,7 +260,7 @@ class Dinov3NavNode(Node):
             hard_nontrav_threshold=float(p["bev.hard_nontrav_threshold"]),
             hard_nontrav_min_cells=int(p["bev.hard_nontrav_min_cells"]),
         )
-        self._bev_fusion = MetricTemporalBEVFusion(TemporalBEVConfig(
+        self._bev_fusion = TemporalBEVFusion(TemporalBEVConfig(
             enabled=bool(p["bev.temporal_enable"]),
             evidence_half_life_s=float(p["bev.temporal_half_life_s"]),
             max_evidence=float(p["bev.temporal_max_evidence"]),
@@ -278,54 +280,69 @@ class Dinov3NavNode(Node):
             clearance_cost_weight=float(p["planning.clearance_cost_weight"]),
         )
         self._fusion_frame = str(p["bev.temporal_frame"]).strip()
+        self._prev_fusion_pose: Optional[np.ndarray] = None
+        self._prev_fusion_time: Optional[float] = None
         self._planner = MPPIPlanner(MPPIConfig(
             horizon_steps=int(p["mppi.horizon_steps"]), dt=float(p["mppi.dt"]),
             samples=int(p["mppi.samples"]), temperature=float(p["mppi.temperature"]),
             noise_vx=float(p["mppi.noise_vx"]), noise_vy=float(p["mppi.noise_vy"]), noise_wz=float(p["mppi.noise_wz"]),
             min_vx=float(p["mppi.min_vx"]), max_vx=float(p["mppi.max_vx"]),
+            nominal_vx=float(p["mppi.nominal_vx"]),
             max_vy=float(p["mppi.max_vy"]), max_wz=float(p["mppi.max_wz"]),
             max_accel_vx=float(p["mppi.max_accel_vx"]), max_accel_vy=float(p["mppi.max_accel_vy"]), max_accel_wz=float(p["mppi.max_accel_wz"]),
             start_relax_distance=float(p["mppi.start_relax_distance"]),
-            unknown_footprint_weight=float(p["mppi.unknown_footprint_weight"]),
-            exploration_fraction=float(p["mppi.exploration_fraction"]),
-            valid_fraction_slow=float(p["mppi.valid_fraction_slow"]),
-            clearance_slow_m=float(p["mppi.clearance_slow_m"]),
-            slow_speed_scale=float(p["mppi.slow_speed_scale"]),
-            turn_trigger_clearance_m=float(p["mppi.turn_trigger_clearance_m"]),
-            min_detour_wz=float(p["mppi.min_detour_wz"]),
             goal_weight=float(p["mppi.goal_weight"]), terminal_goal_weight=float(p["mppi.terminal_goal_weight"]),
             heading_weight=float(p["mppi.heading_weight"]), costmap_weight=float(p["mppi.costmap_weight"]),
             control_weight=float(p["mppi.control_weight"]), smooth_weight=float(p["mppi.smooth_weight"]),
+            angular_deadband=float(p["mppi.angular_deadband"]),
+            side_commit_steps=int(p["mppi.side_commit_steps"]),
             seed=int(p["mppi.seed"]),
         ))
-
+        self._mppi_dt = self._planner.cfg.dt
         # ----------------------------- control / global goal
         self._control_enabled = bool(p["control.enabled"])
         self._goal_enabled = bool(p["global.enable"])
         self._goal_tolerance = float(p["control.goal_tolerance"])
-        self._mppi_local_goal_distance = float(p["mppi.local_goal_distance"])
-        self._watchdog = float(p["control.watchdog"])
+        # This is deliberately based on the last BEV collision validation,
+        # not on the start/end of an image callback.  DINO inference is
+        # allowed to take longer than one control period, so publishing zero
+        # throughout a valid inference interval causes a walk-stop-walk gait.
+        self._max_bev_age = float(p["control.max_bev_age"])
+        # Image inference can take substantially longer than a ROS callback
+        # budget.  The goal subscription therefore has its own callback group
+        # (see below), and this lock makes the hand-off to the image callback
+        # explicit and race-free.
+        self._goal_lock = threading.Lock()
+        self._command_lock = threading.Lock()
+        self._goal_callback_group = MutuallyExclusiveCallbackGroup()
         self._cmd: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        # A plan is a time sequence, not one command to repeat.  The timer
+        # below executes these entries at MPPI's dt while DINO prepares the
+        # next BEV, so an old angular command cannot spin the robot in place.
+        self._active_controls: Optional[np.ndarray] = None
+        self._active_control_started: Optional[float] = None
         self._odom_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._goal: Optional[PoseStamped] = None
+        self._goal_revision = 0
         self._goal_reached = False
         self._last_plan: Optional[MPPIResult] = None
+        self._last_mppi_plan_time: Optional[float] = None
+        self._last_mppi_goal_revision = -1
+        self._last_safe_bev_time: Optional[float] = None
+        # <= 0 disables time-driven MPPI resampling.  Cached trajectories are
+        # still validated against every fresh BEV before control is reused.
+        self._mppi_replan_max_age = float(p["mppi.replan_max_age"])
         self._last_mode: str = ""
         self._last_goal_local: Optional[Tuple[float, float]] = None
-        self._last_result: Optional[float] = None
         self._last_process: Optional[float] = None
         self._process_period = float(p["process_period"])
-        self._mppi_replan_rate = max(0.5, float(p["mppi.replan_rate"]))
-        self._planning_lock = threading.Lock()
-        self._latest_planning: Optional[PlanningBEV] = None
-        self._latest_mppi_goal: Optional[Tuple[float, float]] = None
-        self._latest_path = None
         self._frame_count = 0
         self._debug_show_window = bool(p["debug.show_window"])
         self._debug_window_name = str(p["debug.window_name"])
         self._debug_window_scale = float(p["debug.window_scale"])
         self._debug_window_rate_hz = max(1.0, float(p["debug.window_rate_hz"]))
         self._debug_window_backend = str(p["debug.window_backend"]).strip().lower()
+        self._profile_timing = bool(p["debug.profile_timing"])
         if self._debug_window_backend not in ("auto", "opencv", "tk"):
             raise ValueError("debug.window_backend must be auto, opencv, or tk")
         self._debug_window_active = self._debug_show_window
@@ -367,8 +384,6 @@ class Dinov3NavNode(Node):
         )
         self._coverage_pub = self.create_publisher(Float32, p["coverage_topic"], 10)
         self._status_pub = self.create_publisher(String, p["planner_status_topic"], 10)
-        self._local_map_pub = self.create_publisher(OccupancyGrid, p["local_map_topic"], 10)
-        self._local_path_pub = self.create_publisher(NavPath, p["local_path_topic"], 10)
         self._overlay_pub = (
             self.create_publisher(Image, p["overlay_topic"], qos_profile_sensor_data)
             if p["publish_overlay"]
@@ -435,7 +450,7 @@ class Dinov3NavNode(Node):
         )
 
         # ----------------------------- subscriptions
-        self.create_subscription(
+        self._camera_info_sub = self.create_subscription(
             CameraInfo,
             p["camera_info_topic"],
             self._on_camera_info,
@@ -443,23 +458,38 @@ class Dinov3NavNode(Node):
         )
         if self._depth_enabled:
             sub_rgb = Subscriber(
-                self, Image, p["image_topic"], qos_profile=qos_profile_sensor_data
+                self, Image, p["image_topic"], qos_profile=self._image_qos
             )
             sub_depth = Subscriber(
-                self, Image, p["depth_topic"], qos_profile=qos_profile_sensor_data
+                self, Image, p["depth_topic"], qos_profile=self._image_qos
             )
             self._sync = ApproximateTimeSynchronizer(
-                [sub_rgb, sub_depth], queue_size=10, slop=float(p["depth.sync_slop"])
+                [sub_rgb, sub_depth], queue_size=1, slop=float(p["depth.sync_slop"])
             )
             self._sync.registerCallback(self._on_images)
         else:
-            self.create_subscription(
-                Image, p["image_topic"], self._on_image, qos_profile_sensor_data
+            self._image_sub = self.create_subscription(
+                Image, p["image_topic"], self._on_image, self._image_qos
             )
         if self._goal_enabled:
-            self.create_subscription(PoseStamped, p["goal_pose_topic"], self._on_goal, 10)
-        self.create_subscription(Odometry, p["odom_topic"], self._on_odom, qos_profile_sensor_data)
-        self.create_subscription(PointCloud2, p["lidar_topic"], self._on_lidar, qos_profile_sensor_data)
+            # Do not use the default callback group: it is occupied by the
+            # synchronous RGB-D inference callback while a frame is planned.
+            # A dedicated group lets a MultiThreadedExecutor accept a newly
+            # published goal immediately instead of waiting for that frame.
+            self._goal_sub = self.create_subscription(
+                PoseStamped,
+                p["goal_pose_topic"],
+                self._on_goal,
+                10,
+                callback_group=self._goal_callback_group,
+            )
+        self._odom_sub = self.create_subscription(
+            Odometry,
+            p["odom_topic"],
+            self._on_odom,
+            qos_profile_sensor_data,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+        )
 
         if self._cmd_pub is not None:
             self.create_timer(
@@ -467,14 +497,12 @@ class Dinov3NavNode(Node):
                 self._on_cmd_timer,
                 callback_group=MutuallyExclusiveCallbackGroup(),
             )
-        self.create_timer(
-            1.0 / self._mppi_replan_rate,
-            self._on_mppi_timer,
-            callback_group=MutuallyExclusiveCallbackGroup(),
-        )
 
         self.get_logger().info(
             "dinov3_nav MPPI planner ready: "
+            f"DINOv3_device='{self._gseg.device}', "
+            f"SAM2_device='{self._sam2.device if self._sam2 is not None else 'disabled'}', "
+            f"CUDA_VISIBLE_DEVICES='{os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}', "
             f"planner_frame='{self._planner_frame}', goal_frame="
             f"'{self._default_goal_frame}', convention="
             f"{self._projection_convention}, "
@@ -494,9 +522,6 @@ class Dinov3NavNode(Node):
             "cmd_vel_topic": "/cmd_vel",
             "goal_pose_topic": "/goal_pose",
             "odom_topic": "/odom",
-            "lidar_topic": "/points",
-            "local_map_topic": "/local_map",
-            "local_path_topic": "/local_path",
             "ground_mask_topic": "/dinov3_nav/ground_mask",
             "traversable_mask_topic": "/dinov3_nav/traversable_mask",
             "safe_mask_topic": "/dinov3_nav/safe_mask",
@@ -517,10 +542,15 @@ class Dinov3NavNode(Node):
             # the Gazebo zed_x case) or "body" (TF frame already optical).
             "camera.projection_convention": "optical",
             "global.default_goal_frame": "odom",
+            "segmentation.use_depth_fusion": False,
+            # Load weights and run a synthetic CUDA warmup before subscribing
+            # to camera topics. This prevents the first real image from
+            # absorbing model-load and kernel-initialization latency.
+            "perception.preload": True,
             # robot geometry
             "robot.length": 0.65,
             "robot.width": 0.40,
-            "robot.safety_margin": 0.08,
+            "robot.safety_margin": 0.18,
             "robot.center_x": 0.0,
             "robot.center_y": 0.0,
             "robot.footprint_sample_step": 0.05,
@@ -563,18 +593,11 @@ class Dinov3NavNode(Node):
             "bev.drop_height": 0.25,
             "bev.min_ground_z_points": 200,
             "bev.min_observed_fraction": 0.05,
-            "bev.visibility_raycast": True,
+            "bev.visibility_raycast": False,
             "bev.visibility_raycast_stride_px": 8,
             "bev.traversability_threshold": 0.50,
             "bev.hard_nontrav_threshold": 0.15,
             "bev.hard_nontrav_min_cells": 3,
-            "rolling_map.ttl_s": 2.0,
-            "rolling_map.visual_unknown_value": 0.55,
-            "lidar.ground_tolerance_m": 0.12,
-            "lidar.obstacle_height_m": 0.18,
-            "lidar.self_filter_radius_m": 0.45,
-            "astar.lookahead_m": 0.9,
-            "mapping.use_lidar": True,
             # Robot-centred temporal map.  Stored evidence is motion-
             # compensated through odom before it is fused with a raw frame.
             "bev.temporal_enable": True,
@@ -587,7 +610,7 @@ class Dinov3NavNode(Node):
             "bev.temporal_min_observed_evidence": 0.50,
             "bev.temporal_obstacle_threshold": 1.25,
             "bev.cleanup_min_obstacle_cells": 2,
-            "bev.ego_clear_radius_m": 0.30,
+            "bev.ego_clear_radius_m": 0.0,
             "bev.ego_clear_traversability": 0.80,
             # UNKNOWN stays traversable at a penalty;
             # hard/inflated cells are +inf and clearance raises local cost.
@@ -598,7 +621,7 @@ class Dinov3NavNode(Node):
             # MPPI samples complete vx/vy/wz sequences over this horizon.
             # max_vy=0 is deliberate for a differential-drive base; set it
             # nonzero only for a robot/controller that accepts lateral twist.
-            "mppi.horizon_steps": 24,
+            "mppi.horizon_steps": 30,
             "mppi.dt": 0.10,
             "mppi.samples": 384,
             "mppi.temperature": 1.0,
@@ -606,29 +629,24 @@ class Dinov3NavNode(Node):
             "mppi.noise_vy": 0.08,
             "mppi.noise_wz": 0.55,
             "mppi.min_vx": -0.10,
-            "mppi.max_vx": 0.40,
+            "mppi.max_vx": 0.80,
+            "mppi.nominal_vx": 0.40,
             "mppi.max_vy": 0.0,
             "mppi.max_wz": 1.20,
             "mppi.max_accel_vx": 0.60,
             "mppi.max_accel_vy": 0.50,
             "mppi.max_accel_wz": 1.80,
             "mppi.start_relax_distance": 0.90,
-            "mppi.unknown_footprint_weight": 2.0,
-            "mppi.exploration_fraction": 0.35,
-            "mppi.valid_fraction_slow": 0.12,
-            "mppi.clearance_slow_m": 0.35,
-            "mppi.slow_speed_scale": 0.45,
-            "mppi.local_goal_distance": 2.0,
-            "mppi.turn_trigger_clearance_m": 0.45,
-            "mppi.min_detour_wz": 0.05,
-            "mppi.replan_rate": 5.0,
             "mppi.goal_weight": 5.0,
             "mppi.terminal_goal_weight": 10.0,
             "mppi.heading_weight": 0.8,
             "mppi.costmap_weight": 1.0,
             "mppi.control_weight": 0.08,
             "mppi.smooth_weight": 0.35,
+            "mppi.angular_deadband": 0.04,
+            "mppi.side_commit_steps": 8,
             "mppi.seed": 7,
+            "mppi.replan_max_age": 0.0,
             # control/global
             "control.enabled": False,
             "control.max_angular": 1.2,
@@ -636,7 +654,11 @@ class Dinov3NavNode(Node):
             "control.angular_gain": 1.5,
             "control.turn_in_place_angle_deg": 43.0,
             "control.cmd_rate": 10.0,
-            "control.watchdog": 1.5,
+            # Keep a BEV-validated command alive across normal DINO frame
+            # time.  The 4 m BEV and 0.8 m/s cap give a conservative
+            # perception horizon; lower this if the camera pipeline becomes
+            # substantially slower or the speed cap is increased.
+            "control.max_bev_age": 3.5,
             "control.goal_tolerance": 0.35,
             "global.enable": True,
             # output/run
@@ -649,6 +671,10 @@ class Dinov3NavNode(Node):
             "debug.window_scale": 1.0,
             "debug.window_rate_hz": 20.0,
             "debug.window_backend": "auto",
+            # Print a per-frame timing breakdown for live performance
+            # diagnosis.  Disabled by default because it is intentionally
+            # verbose on a camera stream.
+            "debug.profile_timing": False,
         }
         values = {}
         for name, default in defaults.items():
@@ -663,8 +689,17 @@ class Dinov3NavNode(Node):
         self._camera_info = msg
 
     def _on_goal(self, msg: PoseStamped):
-        self._goal = msg
-        self._goal_reached = False
+        # Keep this callback deliberately small.  Transforming the target is
+        # deferred to the image/planning callback, where the current TF is
+        # needed anyway.
+        with self._goal_lock:
+            self._goal = msg
+            self._goal_revision += 1
+            self._goal_reached = False
+            self._last_goal_local = None
+        # A goal replacement must never continue the old trajectory while
+        # the next RGB-D frame is being processed.
+        self._clear_active_control()
         self.get_logger().info(
             f"new goal ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}) "
             f"frame='{msg.header.frame_id or self._default_goal_frame}'"
@@ -680,122 +715,55 @@ class Dinov3NavNode(Node):
         tw = msg.twist.twist
         self._odom_velocity = (float(tw.linear.x), float(tw.linear.y), float(tw.angular.z))
 
-    def _on_mppi_timer(self):
-        """Replan independently of DINO inference using the newest costmap."""
-        with self._planning_lock:
-            planning = self._latest_planning
-            goal = self._latest_mppi_goal
-        if planning is None or goal is None or self._goal_reached or not self._sanity_ok:
-            self._cmd = (0.0, 0.0, 0.0)
-            return
-        try:
-            checker = FootprintChecker(planning.grid, self._foot_cfg, planning.layers)
-            plan = self._planner.plan(planning, checker, goal, self._odom_velocity)
-            self._last_plan = plan
-            self._cmd = plan.command
-            self._last_result = time.monotonic()
-        except Exception as exc:
-            self._cmd = (0.0, 0.0, 0.0)
-            self.get_logger().error(f"MPPI timer failed: {exc}", throttle_duration_sec=5.0)
-
-    @staticmethod
-    def _cloud_xyz(msg: PointCloud2) -> np.ndarray:
-        """Extract x/y/z without requiring sensor_msgs_py in the DINO venv."""
-        fields = {field.name: field for field in msg.fields}
-        if not all(name in fields for name in ("x", "y", "z")) or msg.point_step <= 0:
-            return np.empty((0, 3), np.float32)
-        # ROS PointField.FLOAT32 is datatype 7; most LiDAR drivers use it.
-        if any(fields[name].datatype != 7 for name in ("x", "y", "z")):
-            return np.empty((0, 3), np.float32)
-        dtype = np.dtype({"names": ["x", "y", "z"], "formats": ["<f4"] * 3,
-                          "offsets": [fields[n].offset for n in ("x", "y", "z")],
-                          "itemsize": msg.point_step})
-        raw = np.frombuffer(msg.data, dtype=dtype, count=msg.width * msg.height)
-        points = np.column_stack((raw["x"], raw["y"], raw["z"])).astype(np.float32)
-        return points[np.isfinite(points).all(axis=1)]
-
-    def _publish_local_map(self, bev, header) -> None:
-        msg = OccupancyGrid(); msg.header = header; msg.header.frame_id = self._planner_frame
-        msg.info.resolution = float(bev.cfg.resolution)
-        msg.info.width, msg.info.height = int(bev.shape[0]), int(bev.shape[1])
-        msg.info.origin.position.x, msg.info.origin.position.y = bev.cfg.x_min, bev.cfg.y_min
-        msg.info.origin.orientation.w = 1.0
-        values = np.full(bev.shape, -1, np.int8)
-        values[bev.observed & (bev.traversability >= .5)] = 0
-        values[bev.observed & (bev.traversability < .5)] = 50
-        values[bev.obstacle] = 100
-        # OccupancyGrid rows are y, columns x; BEV storage is x, y.
-        msg.data = values.T.reshape(-1).tolist(); self._local_map_pub.publish(msg)
-
-    def _publish_local_path(self, path, header) -> None:
-        msg = NavPath(); msg.header = header; msg.header.frame_id = self._planner_frame
-        for x, y in path.points:
-            pose = PoseStamped(); pose.header = msg.header; pose.pose.position.x = x; pose.pose.position.y = y; pose.pose.orientation.w = 1.0
-            msg.poses.append(pose)
-        self._local_path_pub.publish(msg)
-
-    def _on_lidar(self, msg: PointCloud2):
-        """LiDAR owns geometry; DINO only annotates camera-visible ground."""
-        points = self._cloud_xyz(msg)
-        if not len(points): return
-        try:
-            lidar_frame = msg.header.frame_id
-            T_base_lidar = transform_to_matrix(self._tf_buffer.lookup_transform(
-                self._planner_frame, lidar_frame, Time(), timeout=Duration(seconds=.10)).transform)
-            points_base = points @ T_base_lidar[:3, :3].T + T_base_lidar[:3, 3]
-            T_odom_base = transform_to_matrix(self._tf_buffer.lookup_transform(
-                self._fusion_frame, self._planner_frame, Time(), timeout=Duration(seconds=.10)).transform)
-        except TransformException as exc:
-            self.get_logger().warning(f"LiDAR TF unavailable: {exc}", throttle_duration_sec=5.0); return
-        visual = np.full(len(points_base), float(self._rolling_map.cfg.visual_unknown_value), np.float32)
-        latest = self._latest_visual
-        if latest is not None:
-            mask, K, T_base_camera = latest
-            T_camera_base = np.linalg.inv(T_base_camera)
-            cam = points_base @ T_camera_base[:3, :3].T + T_camera_base[:3, 3]
-            z = cam[:, 2]
-            u = np.full(len(cam), -1, np.int32); v = np.full(len(cam), -1, np.int32)
-            front = np.isfinite(z) & (z > .05)
-            u[front] = np.rint(K[0,0]*cam[front,0]/z[front]+K[0,2]).astype(np.int32)
-            v[front] = np.rint(K[1,1]*cam[front,1]/z[front]+K[1,2]).astype(np.int32)
-            inside = front & (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
-            visual[inside] = (mask[v[inside], u[inside]] > 0).astype(np.float32)
-        now = time.monotonic(); self._rolling_map.add(points_base, visual, T_odom_base, now)
-        bev = self._rolling_map.rasterize(T_odom_base, now)
-        planning = build_planning_bev(bev, self._foot_cfg, self._planning_cost_cfg)
-        start_check = FootprintChecker(planning.grid, self._foot_cfg, planning.layers).check_pose(
-            0.0, 0.0, 0.0, relax_surface=True
-        )
-        if not start_check.valid:
-            self.get_logger().warning(
-                f"local_map blocks robot footprint ({start_check.reason}); "
-                f"obstacle_cells={int(planning.hard_obstacle.sum())}, "
-                f"inflated_cells={int(planning.inflated_obstacle.sum())}. "
-                "Check LiDAR frame, lidar.self_filter_radius_m and debug map.",
-                throttle_duration_sec=3.0,
-            )
-        goal, _ = self._goal_in_planner()
-        path = self._astar.plan(planning, self._local_mppi_goal(goal)) if goal is not None else None
-        lookahead = self._astar.lookahead(path, self._astar_lookahead) if path is not None else None
-        with self._planning_lock:
-            self._latest_planning, self._latest_mppi_goal, self._latest_path = planning, lookahead, path
-        self._publish_local_map(bev, msg.header)
-        if path is not None: self._publish_local_path(path, msg.header)
-        if self._bev_debug_pub is not None:
-            image = render_bev_debug(
-                planning.grid, planning.layers, self._last_plan, goal, scale=5,
-                footprint=(self._foot_cfg.length, self._foot_cfg.width),
-                reference_path=(path.points if path is not None else None),
-            )
-            debug_msg = rgb_to_image_msg(image, msg.header)
-            debug_msg.header.frame_id = self._planner_frame
-            self._bev_debug_pub.publish(debug_msg)
-
     def _on_images(self, rgb_msg: Image, depth_msg: Image):
         self._process(rgb_msg, depth_msg)
 
     def _on_image(self, rgb_msg: Image):
         self._process(rgb_msg, None)
+
+    def _warmup_perception(self) -> None:
+        """Preload DINO/SAM2 and initialize CUDA before camera subscriptions.
+
+        Both upstream wrappers intentionally load lazily.  In a ROS camera
+        pipeline that deferred work makes the first received image stale by
+        tens of seconds.  A small 16:9 dummy image triggers the same model
+        loading and first CUDA kernels while no sensor messages are queued.
+        """
+        self.get_logger().info("preloading DINOv3/SAM2 and warming CUDA...")
+        started = time.perf_counter()
+        # The input has the same 16:9 aspect ratio as the configured ZED feed;
+        # DINO subsequently applies its normal 448-pixel short-side resize.
+        warmup_rgb = np.zeros((448, 800, 3), dtype=np.uint8)
+        try:
+            dino_started = time.perf_counter()
+            prepared = self._gseg.prepare(warmup_rgb)
+            ground = self._gseg.segment_prepared(prepared, depth=None)
+            self._synchronize_perception_device()
+            dino_s = time.perf_counter() - dino_started
+
+            sam2_s = 0.0
+            if self._sam2 is not None:
+                sam2_started = time.perf_counter()
+                # Explicitly load even if the synthetic DINO proposal happens
+                # to be empty and refine_prepared would otherwise return early.
+                self._sam2._ensure_model()
+                self._sam2.refine_prepared(prepared, ground.mask)
+                self._synchronize_perception_device()
+                sam2_s = time.perf_counter() - sam2_started
+            self.get_logger().info(
+                "perception preload complete: "
+                f"dino={dino_s:.2f}s sam2={sam2_s:.2f}s "
+                f"total={time.perf_counter() - started:.2f}s"
+            )
+        except Exception as exc:
+            # A later real-frame callback retains its normal exception handling
+            # and can still run, while startup reports why preloading failed.
+            self.get_logger().warning(f"perception preload failed: {exc}")
+
+    def _synchronize_perception_device(self) -> None:
+        """Make one-off CUDA initialization timings truthful in diagnostics."""
+        if self._gseg.device.type == "cuda":
+            torch.cuda.synchronize(self._gseg.device)
 
     # ----------------------------- geometry helpers
     def _camera_matrix(self, image_shape: Tuple[int, int]) -> Optional[np.ndarray]:
@@ -894,18 +862,25 @@ class Dinov3NavNode(Node):
             )
         return ok
 
-    def _goal_in_planner(self) -> Tuple[Optional[Tuple[float, float]], Optional[float]]:
+    def _goal_in_planner(
+        self,
+    ) -> Tuple[Optional[Tuple[float, float]], Optional[float], int]:
         if not self._goal_enabled:
             # no global goal: walk forward (waypoint at BEV front edge)
-            return (self._bev_cfg.x_max - 0.5, 0.0), float("inf")
-        if self._goal is None:
-            return None, None
-        goal_frame = self._goal.header.frame_id or self._default_goal_frame
+            return (self._bev_cfg.x_max - 0.5, 0.0), float("inf"), -1
+        # Copy the reference under the lock, then do the potentially blocking
+        # TF lookup without holding up a newly received goal callback.
+        with self._goal_lock:
+            goal = self._goal
+            goal_revision = self._goal_revision
+        if goal is None:
+            return None, None, goal_revision
+        goal_frame = goal.header.frame_id or self._default_goal_frame
         p = np.array(
             [
-                self._goal.pose.position.x,
-                self._goal.pose.position.y,
-                self._goal.pose.position.z,
+                goal.pose.position.x,
+                goal.pose.position.y,
+                goal.pose.position.z,
                 1.0,
             ],
             np.float32,
@@ -925,38 +900,45 @@ class Dinov3NavNode(Node):
                     f"goal TF unavailable: {self._planner_frame} <- {goal_frame}: {exc}",
                     throttle_duration_sec=5.0,
                 )
-                return None, None
+                return None, None, goal_revision
             local = transform_to_matrix(tf.transform) @ p
         gx, gy = float(local[0]), float(local[1])
-        return (gx, gy), hypot(gx, gy)
-
-    def _local_mppi_goal(self, goal: Tuple[float, float]) -> Tuple[float, float]:
-        """Keep terminal optimisation inside the metric horizon/costmap."""
-        d = hypot(*goal)
-        lookahead = max(0.2, self._mppi_local_goal_distance)
-        if d <= lookahead:
-            return goal
-        return goal[0] * lookahead / d, goal[1] * lookahead / d
+        return (gx, gy), hypot(gx, gy), goal_revision
 
     def _fuse_raw_bev(self, raw_bev):
-        """Re-rasterize short-term metric observations into current base_link."""
+        """Motion-compensate prior evidence, then fuse this raw sensor frame."""
         now = time.monotonic()
-        T_temporal_from_current = None
+        T_current_from_previous = None
+        current_pose = None
         if self._fusion_frame:
             try:
                 tf = self._tf_buffer.lookup_transform(
                     self._fusion_frame, self._planner_frame, Time(),
                     timeout=Duration(seconds=0.15),
                 )
-                T_temporal_from_current = transform_to_matrix(tf.transform)
+                current_pose = transform_to_matrix(tf.transform)
+                if self._prev_fusion_pose is not None:
+                    relative = np.linalg.inv(current_pose) @ self._prev_fusion_pose
+                    T_current_from_previous = relative[:3, :3]
+                    T_current_from_previous = np.array(
+                        [[relative[0, 0], relative[0, 1], relative[0, 3]],
+                         [relative[1, 0], relative[1, 1], relative[1, 3]],
+                         [0.0, 0.0, 1.0]], np.float32,
+                    )
             except TransformException as exc:
                 self._bev_fusion.reset()
+                self._prev_fusion_pose = None
+                self._prev_fusion_time = None
                 self.get_logger().warning(
                     f"temporal BEV TF unavailable ({self._fusion_frame} <- "
                     f"{self._planner_frame}); using raw frame: {exc}",
                     throttle_duration_sec=5.0,
                 )
-        return self._bev_fusion.update(raw_bev, now, T_temporal_from_current)
+        dt = 0.0 if self._prev_fusion_time is None else now - self._prev_fusion_time
+        stable = self._bev_fusion.update(raw_bev, dt, T_current_from_previous)
+        self._prev_fusion_pose = current_pose
+        self._prev_fusion_time = now
+        return stable
 
     def _depth_obstacle(self, depth: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
         """Image-space near-depth obstacle (debug overlay only; the BEV uses
@@ -1106,13 +1088,38 @@ class Dinov3NavNode(Node):
                 self.get_logger().warning(f"depth conversion failed: {exc}", throttle_duration_sec=10.0)
 
         t0 = time.perf_counter()
+        perception_s = dino_s = sam2_s = stairs_s = 0.0
+        dino_load_s = dino_forward_s = sam2_load_s = sam2_forward_s = 0.0
+        goal_tf_s = bev_project_s = bev_fusion_s = 0.0
+        costmap_s = mppi_s = debug_render_s = 0.0
         try:
+            # GroundSegmenter and SAM2MaskRefiner intentionally load lazily.
+            # Split that one-off cost from actual image inference so a slow
+            # cold start is not mistaken for low steady-state throughput.
+            if self._gseg._extractor._model is None:
+                dino_load_t0 = time.perf_counter()
+                self._gseg._ensure_model()
+                self._synchronize_perception_device()
+                dino_load_s = time.perf_counter() - dino_load_t0
+            dino_t0 = time.perf_counter()
             prepared = self._gseg.prepare(rgb)
-            ground = self._gseg.segment_prepared(prepared, depth=depth)
+            ground = self._gseg.segment_prepared(
+                prepared, depth=depth if self._gseg_depth_fusion else None
+            )
+            dino_s = time.perf_counter() - dino_t0
+            dino_forward_s = dino_s
             if self._sam2 is not None:
                 try:
+                    if self._sam2._predictor is None:
+                        sam2_load_t0 = time.perf_counter()
+                        self._sam2._ensure_model()
+                        self._synchronize_perception_device()
+                        sam2_load_s = time.perf_counter() - sam2_load_t0
+                    sam2_t0 = time.perf_counter()
                     coarse_mask = ground.mask.copy()
                     refined = self._sam2.refine_prepared(prepared, coarse_mask)
+                    sam2_s = time.perf_counter() - sam2_t0
+                    sam2_forward_s = sam2_s
                     if refined.iou_with_coarse >= 0.35:
                         # ground_seg has already used depth geometry to suppress
                         # above-ground regions. Limit SAM2 expansion around that
@@ -1135,55 +1142,53 @@ class Dinov3NavNode(Node):
                     self.get_logger().warning(
                         f"SAM2 refinement failed: {exc}", throttle_duration_sec=10.0
                     )
+            stairs_t0 = time.perf_counter()
             sres = self._stairs.detect_prepared(prepared) if self._stairs is not None else None
+            stairs_s = time.perf_counter() - stairs_t0
             traversable = ground.mask.copy()
             if sres is not None and self._stairs_traversable and sres.mask.any():
                 traversable = cv2.bitwise_or(traversable, sres.mask)
         except Exception as exc:
             self.get_logger().error(f"perception failed: {exc}", throttle_duration_sec=10.0)
-            self._cmd = (0.0, 0.0, 0.0)
+            self._clear_active_control()
             return
+        perception_s = time.perf_counter() - t0
 
         obstacle_pixels = None
-        local_goal, goal_distance = self._goal_in_planner()
+        goal_tf_t0 = time.perf_counter()
+        local_goal, goal_distance, frame_goal_revision = self._goal_in_planner()
+        goal_tf_s = time.perf_counter() - goal_tf_t0
         self._last_goal_local = local_goal
-        self._goal_reached = (
-            goal_distance is not None and goal_distance <= self._goal_tolerance
-        )
+        with self._goal_lock:
+            if frame_goal_revision == self._goal_revision:
+                self._goal_reached = (
+                    goal_distance is not None and goal_distance <= self._goal_tolerance
+                )
 
-        plan: Optional[MPPIResult] = self._last_plan
+        plan: Optional[MPPIResult] = None
         bev_debug = None
         bev = None
         raw_bev = None
         planning: Optional[PlanningBEV] = None
         near_obstacle = self._depth_obstacle(depth, rgb.shape[:2])
-        # Visual traversability remains useful without RGB-D: LiDAR later
-        # projects its own metric points into this latest camera mask.
-        K_visual = self._camera_matrix(rgb.shape[:2])
-        T_visual = self._camera_to_planner()
-        if K_visual is not None and T_visual is not None:
-            self._latest_visual = (traversable.copy(), K_visual.copy(), T_visual.copy())
-        if self._goal_reached:
-            self._cmd = (0.0, 0.0, 0.0)
+        if self._goal_reached_now():
+            self._clear_active_control()
         elif depth is None:
-            if not self._use_lidar_mapping:
-                self._cmd = (0.0, 0.0, 0.0)
-                self.get_logger().warning("BEV planner requires depth", throttle_duration_sec=5.0)
+            self._clear_active_control()
+            self.get_logger().warning("BEV planner requires depth", throttle_duration_sec=5.0)
         else:
             K = self._camera_matrix(depth.shape)
             T = self._camera_to_planner()
             if K is None:
-                self._cmd = (0.0, 0.0, 0.0)
+                self._clear_active_control()
                 self.get_logger().warning("waiting for valid CameraInfo", throttle_duration_sec=5.0)
             elif T is None:
-                self._cmd = (0.0, 0.0, 0.0)
+                self._clear_active_control()
             else:
-                # LiDAR callback uses this only to annotate geometry points
-                # inside the current camera FOV; it never creates obstacles.
-                self._latest_visual = (traversable.copy(), K.copy(), T.copy())
                 if self._sanity_ok is None:
                     self._sanity_ok = self._projection_sanity(K, T)
                 try:
+                    bev_t0 = time.perf_counter()
                     raw_bev = build_local_bev(
                         traversable_mask=traversable,
                         depth=depth,
@@ -1191,50 +1196,103 @@ class Dinov3NavNode(Node):
                         T_planner_from_camera=T,
                         cfg=self._bev_cfg,
                     )
+                    bev_project_s = time.perf_counter() - bev_t0
                     obstacle_pixels = raw_bev.obstacle_pixels
+                    fusion_t0 = time.perf_counter()
                     bev = self._fuse_raw_bev(raw_bev)
+                    bev_fusion_s = time.perf_counter() - fusion_t0
                     observed_fraction = float(bev.observed.mean())
                     if observed_fraction < self._min_observed_fraction:
-                        self._cmd = (0.0, 0.0, 0.0)
+                        self._clear_active_control()
                         self.get_logger().warning(
                             f"BEV observed only {observed_fraction:.1%} of cells; "
                             "stopping (depth/CameraInfo problem?)",
                             throttle_duration_sec=5.0,
                         )
                     elif not self._sanity_ok:
-                        self._cmd = (0.0, 0.0, 0.0)
+                        self._clear_active_control()
                     else:
+                        costmap_t0 = time.perf_counter()
                         planning = build_planning_bev(
                             bev, self._foot_cfg, self._planning_cost_cfg
                         )
-                        mppi_goal = (self._local_mppi_goal(local_goal)
-                                     if local_goal is not None else None)
-                        if not self._use_lidar_mapping:
-                            with self._planning_lock:
-                                self._latest_planning = planning
-                                self._latest_mppi_goal = mppi_goal
+                        costmap_s = time.perf_counter() - costmap_t0
+                        # Do not let a long perception callback resume a
+                        # trajectory for a goal that arrived while this frame
+                        # was being segmented.
+                        with self._goal_lock:
+                            goal_is_current = frame_goal_revision == self._goal_revision
+                        if not goal_is_current:
+                            local_goal = None
+                        self._last_goal_local = local_goal
                         if local_goal is None:
                             # Map production is intentionally independent of
                             # navigation authority. This lets raw/planning BEV
                             # be inspected before a global goal is issued.
-                            self._cmd = (0.0, 0.0, 0.0)
+                            self._clear_active_control()
                         else:
-                            # The MPPI timer consumes this immutable planning
-                            # product independently of the slow DINO callback.
-                            plan = self._last_plan
+                            checker = FootprintChecker(planning.grid, self._foot_cfg, planning.layers)
+                            mppi_t0 = time.perf_counter()
+                            now_mppi = time.monotonic()
+                            elapsed_steps = self._elapsed_control_steps(now_mppi)
+                            goal_revision = frame_goal_revision
+                            replan_due = (
+                                self._last_mppi_plan_time is None
+                                or goal_revision != self._last_mppi_goal_revision
+                                or (
+                                    self._mppi_replan_max_age > 0.0
+                                    and now_mppi - self._last_mppi_plan_time
+                                    >= self._mppi_replan_max_age
+                                )
+                            )
+                            reused = None if replan_due else self._planner.reuse_if_safe(
+                                planning, checker, local_goal, self._odom_velocity,
+                                elapsed_steps=elapsed_steps,
+                            )
+                            if reused is None:
+                                plan = self._planner.plan(
+                                    planning, checker, local_goal, self._odom_velocity,
+                                    elapsed_steps=elapsed_steps,
+                                )
+                                self._last_mppi_plan_time = now_mppi
+                                self._last_mppi_goal_revision = goal_revision
+                            else:
+                                plan = MPPIResult(
+                                    command=tuple(map(float, reused.controls[0])),
+                                    trajectory=reused,
+                                    mode="MPPI_REUSE",
+                                    candidates=[reused],
+                                    effective_samples=1,
+                                    best_cost=float(reused.cost),
+                                    diagnostics={"reused": 1.0},
+                                )
+                            mppi_s = time.perf_counter() - mppi_t0
+                            with self._goal_lock:
+                                command_goal_is_current = (
+                                    frame_goal_revision == self._goal_revision
+                            )
+                            if command_goal_is_current:
+                                self._activate_plan(plan)
+                            else:
+                                # A newer goal won the race while MPPI was
+                                # sampling.  The dedicated goal callback has
+                                # invalidated the old command; do not revive it.
+                                self._clear_active_control()
                         if (self._bev_debug_pub is not None or self._out_dir is not None
                                 or self._debug_window_active):
+                            render_t0 = time.perf_counter()
                             bev_debug = render_bev_debug(
                                 planning.grid, planning.layers, plan, local_goal, scale=5,
                                 footprint=(self._foot_cfg.length, self._foot_cfg.width)
                             )
+                            debug_render_s = time.perf_counter() - render_t0
                 except Exception as exc:
                     self.get_logger().error(
                         f"BEV/planner failed: {exc}", throttle_duration_sec=5.0
                     )
-                    self._cmd = (0.0, 0.0, 0.0)
+                    self._clear_active_control()
 
-        self._last_result = time.monotonic()
+        self._last_plan = plan
         elapsed = time.perf_counter() - t0
 
         # ----------------------------- publish diagnostics
@@ -1268,9 +1326,7 @@ class Dinov3NavNode(Node):
             )
             if self._overlay_pub is not None:
                 self._overlay_pub.publish(rgb_to_image_msg(overlay, header))
-        # With LiDAR mapping enabled, /bev_debug must show exactly the map
-        # consumed by A*/MPPI, published by _on_lidar below.
-        if self._bev_debug_pub is not None and bev_debug is not None and not self._use_lidar_mapping:
+        if self._bev_debug_pub is not None and bev_debug is not None:
             msg = rgb_to_image_msg(bev_debug, header)
             msg.header.frame_id = self._planner_frame
             self._bev_debug_pub.publish(msg)
@@ -1341,6 +1397,19 @@ class Dinov3NavNode(Node):
                 f"frame={self._frame_count} cov={ground.coverage:.2f} "
                 f"{status} t={elapsed:.2f}s"
             )
+        if self._profile_timing:
+            end_to_end_s = time.perf_counter() - t0
+            self.get_logger().info(
+                "timing[s]: "
+                f"perception={perception_s:.2f} dino_load={dino_load_s:.2f} "
+                f"dino_forward={dino_forward_s:.2f} sam2_load={sam2_load_s:.2f} "
+                f"sam2_forward={sam2_forward_s:.2f} stairs={stairs_s:.2f} "
+                f"goal_tf={goal_tf_s:.2f} "
+                f"bev={bev_project_s:.2f} fusion={bev_fusion_s:.2f} "
+                f"costmap={costmap_s:.2f} mppi={mppi_s:.2f} "
+                f"debug_render={debug_render_s:.2f} "
+                f"core={elapsed:.2f} end_to_end={end_to_end_s:.2f}"
+            )
 
     def _status_text(
         self,
@@ -1348,7 +1417,7 @@ class Dinov3NavNode(Node):
         local_goal: Optional[Tuple[float, float]],
         goal_distance: Optional[float],
     ) -> str:
-        if self._goal_reached:
+        if self._goal_reached_now():
             return f"GOAL_REACHED d={goal_distance:.2f}m cmd=(0,0)"
         goal_txt = "goal=none"
         if local_goal is not None:
@@ -1358,8 +1427,7 @@ class Dinov3NavNode(Node):
         vx, vy, wz = plan.command
         return (
             f"{plan.mode} {goal_txt} valid={plan.effective_samples}/{len(plan.candidates)} "
-            f"cost={plan.best_cost:.2f} clear={plan.min_clearance_m:.2f}m "
-            f"reject={plan.diagnostics} sel=({vx:.2f},{vy:+.2f},{wz:+.2f}) "
+            f"cost={plan.best_cost:.2f} reject={plan.diagnostics} sel=({vx:.2f},{vy:+.2f},{wz:+.2f}) "
             f"cmd=({self._cmd[0]:.2f},{self._cmd[1]:+.2f},{self._cmd[2]:+.2f})"
         )
 
@@ -1385,11 +1453,61 @@ class Dinov3NavNode(Node):
         return out
 
     # ----------------------------- cmd_vel safety timer
+    def _goal_reached_now(self) -> bool:
+        """Return the goal state safely while goal callbacks run in parallel."""
+        with self._goal_lock:
+            return self._goal_reached
+
+    def _clear_active_control(self) -> None:
+        """Stop and invalidate the currently scheduled MPPI sequence."""
+        with self._command_lock:
+            self._cmd = (0.0, 0.0, 0.0)
+            self._active_controls = None
+            self._active_control_started = None
+            self._last_safe_bev_time = None
+
+    def _activate_plan(self, plan: MPPIResult) -> None:
+        """Schedule a collision-checked MPPI control sequence from now."""
+        controls = None if plan.trajectory is None else plan.trajectory.controls
+        if controls is None or len(controls) == 0:
+            self._clear_active_control()
+            return
+        now = time.monotonic()
+        with self._command_lock:
+            self._cmd = tuple(map(float, controls[0]))
+            self._active_controls = controls.astype(np.float32, copy=True)
+            self._active_control_started = now
+            self._last_safe_bev_time = now
+
+    def _elapsed_control_steps(self, now: float) -> int:
+        """How many entries of the active plan have physically elapsed."""
+        with self._command_lock:
+            if self._active_control_started is None:
+                return 1
+            return max(1, int((now - self._active_control_started) / self._mppi_dt))
+
     def _on_cmd_timer(self):
         if self._cmd_pub is None:
             return
-        stale = self._last_result is None or (time.monotonic() - self._last_result) > self._watchdog
-        vx, vy, wz = (0.0, 0.0, 0.0) if stale or self._goal_reached else self._cmd
+        now = time.monotonic()
+        with self._command_lock:
+            stale = (
+                self._last_safe_bev_time is None
+                or (now - self._last_safe_bev_time) > self._max_bev_age
+            )
+            if stale or self._active_controls is None or self._active_control_started is None:
+                vx, vy, wz = (0.0, 0.0, 0.0)
+            else:
+                index = int((now - self._active_control_started) / self._mppi_dt)
+                # The terminal control is deliberately not repeated.  A
+                # delayed DINO frame must cause a safe stop, never a
+                # multi-second repeat of its last yaw command.
+                if index >= len(self._active_controls):
+                    vx, vy, wz = (0.0, 0.0, 0.0)
+                else:
+                    vx, vy, wz = map(float, self._active_controls[index])
+        if self._goal_reached_now():
+            vx, vy, wz = 0.0, 0.0, 0.0
         if self._sanity_ok is not True:
             vx, vy, wz = 0.0, 0.0, 0.0
         msg = Twist()
@@ -1402,7 +1520,7 @@ class Dinov3NavNode(Node):
         self._debug_window_running.clear()
         if self._debug_window_thread is not None and self._debug_window_thread.is_alive():
             self._debug_window_thread.join(timeout=1.0)
-        self._cmd = (0.0, 0.0, 0.0)
+        self._clear_active_control()
         if self._cmd_pub is not None:
             msg = Twist()
             self._cmd_pub.publish(msg)
