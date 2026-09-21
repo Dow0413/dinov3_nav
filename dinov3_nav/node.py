@@ -7,8 +7,8 @@ Pipeline:
       -> optical->body rotation -> TF -> base_link
     BEV (x forward, y left, base_link) with height-based hard obstacles
     global PoseStamped (odom) -> TF -> local goal in base_link
-    BEV free/obstacle -> obstacle inflation -> GDF + SDF -> desired heading
-    desired heading -> (linear.x, angular.z) -> /cmd_vel
+    BEV free/obstacle -> obstacle inflation -> local costmap -> MPPI rollout
+    MPPI (vx, vy, wz sequences) -> /cmd_vel
 
 Frames (verified against gazebo_sim_ws_3 zed_x_camera.xacro):
     planner/global frames   base_link / odom
@@ -20,8 +20,9 @@ Frames (verified against gazebo_sim_ws_3 zed_x_camera.xacro):
 from __future__ import annotations
 
 import time
+import threading
 from array import array
-from math import hypot, radians
+from math import hypot
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -30,6 +31,7 @@ import numpy as np
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
@@ -48,16 +50,16 @@ from ground_seg.sam2_refiner import DEFAULT_SAM2_CKPT
 from .bev import BEVConfig, T_BODY_FROM_OPTICAL, build_local_bev, transform_to_matrix
 from .debug_viz import (
     render_bev_layer,
-    render_gdf_debug,
+    render_bev_debug,
     render_planning_bev,
     render_planning_layer,
     render_raw_bev,
 )
 from .footprint import (
     FootprintConfig,
-    build_footprint_layers,
+    FootprintChecker,
 )
-from .gdf_planner import GDFPlanResult, GDFPlanner, GDFPlannerConfig
+from .mppi import MPPIConfig, MPPIPlanner, MPPIResult
 from .planning_bev import (
     PlanningCostConfig,
     PlanningBEV,
@@ -207,7 +209,7 @@ class Dinov3NavNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        # ----------------------------- BEV / footprint / GDF-SDF planner
+        # ----------------------------- BEV / footprint / MPPI planner
         self._bev_cfg = BEVConfig(
             resolution=float(p["bev.resolution"]),
             x_min=float(p["bev.x_min"]),
@@ -228,16 +230,13 @@ class Dinov3NavNode(Node):
             visibility_raycast_stride_px=int(p["bev.visibility_raycast_stride_px"]),
         )
         self._min_observed_fraction = float(p["bev.min_observed_fraction"])
-        # Point planners consume an obstacle map inflated by half the body
-        # width plus margin.  This is configuration-space inflation, not a
-        # trajectory rollout, and makes every later A*/GDF path body-safe.
+        # MPPI checks the full rectangular footprint at every rollout pose.
+        # Therefore this inflation is only the requested extra clearance;
+        # adding half-width here would double-count the body geometry.
         self._foot_cfg = FootprintConfig(
             length=float(p["robot.length"]),
             width=float(p["robot.width"]),
-            safety_margin=max(
-                float(p["gdf.obstacle_inflation_m"]),
-                0.5 * float(p["robot.width"]) + float(p["robot.safety_margin"]),
-            ),
+            safety_margin=max(0.0, float(p["robot.safety_margin"])),
             center_x=float(p["robot.center_x"]),
             center_y=float(p["robot.center_y"]),
             sample_step=float(p["robot.footprint_sample_step"]),
@@ -267,27 +266,18 @@ class Dinov3NavNode(Node):
         self._fusion_frame = str(p["bev.temporal_frame"]).strip()
         self._prev_fusion_pose: Optional[np.ndarray] = None
         self._prev_fusion_time: Optional[float] = None
-        self._planner = GDFPlanner(GDFPlannerConfig(
-            traversability_threshold=float(p["bev.traversability_threshold"]),
-            unknown_cost=float(p["gdf.unknown_cost"]),
-            goal_search_radius_m=float(p["gdf.goal_search_radius_m"]),
-            lookahead_m=float(p["gdf.lookahead_m"]),
-            clearance_target_m=float(p["sdf.clearance_target_m"]),
-            clearance_emergency_m=float(p["sdf.clearance_emergency_m"]),
-            clearance_gain=float(p["sdf.clearance_gain"]),
-            cruise_linear=float(p["control.cruise_linear"]),
-            max_angular=float(p["control.max_angular"]),
-            angular_gain=float(p["control.angular_gain"]),
-            turn_in_place_angle=radians(float(p["control.turn_in_place_angle_deg"])),
-            side_lock_s=float(p["gdf.side_lock_s"]),
-            side_hysteresis_m=float(p["gdf.side_hysteresis_m"]),
-            avoid_heading_delta=radians(float(p["gdf.avoid_heading_delta_deg"])),
-            avoid_turn_in_place_angle=radians(float(p["gdf.avoid_turn_in_place_angle_deg"])),
-            avoid_min_linear=float(p["gdf.avoid_min_linear"]),
-            corridor_lookahead_m=float(p["gdf.corridor_lookahead_m"]),
-            corridor_half_width_m=float(p["gdf.corridor_half_width_m"]),
-            corridor_emergency_m=float(p["gdf.corridor_emergency_m"]),
-            avoid_exit_clear_frames=int(p["gdf.avoid_exit_clear_frames"]),
+        self._planner = MPPIPlanner(MPPIConfig(
+            horizon_steps=int(p["mppi.horizon_steps"]), dt=float(p["mppi.dt"]),
+            samples=int(p["mppi.samples"]), temperature=float(p["mppi.temperature"]),
+            noise_vx=float(p["mppi.noise_vx"]), noise_vy=float(p["mppi.noise_vy"]), noise_wz=float(p["mppi.noise_wz"]),
+            min_vx=float(p["mppi.min_vx"]), max_vx=float(p["mppi.max_vx"]),
+            max_vy=float(p["mppi.max_vy"]), max_wz=float(p["mppi.max_wz"]),
+            max_accel_vx=float(p["mppi.max_accel_vx"]), max_accel_vy=float(p["mppi.max_accel_vy"]), max_accel_wz=float(p["mppi.max_accel_wz"]),
+            start_relax_distance=float(p["mppi.start_relax_distance"]),
+            goal_weight=float(p["mppi.goal_weight"]), terminal_goal_weight=float(p["mppi.terminal_goal_weight"]),
+            heading_weight=float(p["mppi.heading_weight"]), costmap_weight=float(p["mppi.costmap_weight"]),
+            control_weight=float(p["mppi.control_weight"]), smooth_weight=float(p["mppi.smooth_weight"]),
+            seed=int(p["mppi.seed"]),
         ))
 
         # ----------------------------- control / global goal
@@ -295,10 +285,11 @@ class Dinov3NavNode(Node):
         self._goal_enabled = bool(p["global.enable"])
         self._goal_tolerance = float(p["control.goal_tolerance"])
         self._watchdog = float(p["control.watchdog"])
-        self._cmd: Tuple[float, float] = (0.0, 0.0)
+        self._cmd: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._odom_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._goal: Optional[PoseStamped] = None
         self._goal_reached = False
-        self._last_plan: Optional[GDFPlanResult] = None
+        self._last_plan: Optional[MPPIResult] = None
         self._last_mode: str = ""
         self._last_goal_local: Optional[Tuple[float, float]] = None
         self._last_result: Optional[float] = None
@@ -308,15 +299,21 @@ class Dinov3NavNode(Node):
         self._debug_show_window = bool(p["debug.show_window"])
         self._debug_window_name = str(p["debug.window_name"])
         self._debug_window_scale = float(p["debug.window_scale"])
-        # Rendering uses OpenCV primitives and is published/saved as images.
-        # Never call HighGUI here: Linux wheels implement it through Qt, which
-        # is neither required nor reliable for a ROS navigation process.
-        self._debug_window_active = False
+        self._debug_window_rate_hz = max(1.0, float(p["debug.window_rate_hz"]))
+        self._debug_window_backend = str(p["debug.window_backend"]).strip().lower()
+        if self._debug_window_backend not in ("auto", "opencv", "tk"):
+            raise ValueError("debug.window_backend must be auto, opencv, or tk")
+        self._debug_window_active = self._debug_show_window
+        self._debug_window_running = threading.Event()
+        self._debug_window_lock = threading.Lock()
+        self._debug_window_image: Optional[np.ndarray] = None
+        self._debug_window_thread: Optional[threading.Thread] = None
         if self._debug_show_window:
-            self.get_logger().warning(
-                "debug.show_window is ignored: debug is published/saved with OpenCV "
-                "drawing only; no HighGUI/Qt window is used"
+            self._debug_window_running.set()
+            self._debug_window_thread = threading.Thread(
+                target=self._debug_loop, name="dinov3_nav_debug", daemon=True
             )
+            self._debug_window_thread.start()
 
         # ----------------------------- output
         self._out_dir: Optional[Path] = None
@@ -434,6 +431,7 @@ class Dinov3NavNode(Node):
             )
         if self._goal_enabled:
             self.create_subscription(PoseStamped, p["goal_pose_topic"], self._on_goal, 10)
+        self.create_subscription(Odometry, p["odom_topic"], self._on_odom, qos_profile_sensor_data)
 
         if self._cmd_pub is not None:
             self.create_timer(
@@ -443,7 +441,7 @@ class Dinov3NavNode(Node):
             )
 
         self.get_logger().info(
-            "dinov3_nav GDF/SDF planner ready: "
+            "dinov3_nav MPPI planner ready: "
             f"planner_frame='{self._planner_frame}', goal_frame="
             f"'{self._default_goal_frame}', convention="
             f"{self._projection_convention}, "
@@ -462,6 +460,7 @@ class Dinov3NavNode(Node):
             "camera_info_topic": "/zed/zed_node/rgb/camera_info",
             "cmd_vel_topic": "/cmd_vel",
             "goal_pose_topic": "/goal_pose",
+            "odom_topic": "/odom",
             "ground_mask_topic": "/dinov3_nav/ground_mask",
             "traversable_mask_topic": "/dinov3_nav/traversable_mask",
             "safe_mask_topic": "/dinov3_nav/safe_mask",
@@ -547,42 +546,37 @@ class Dinov3NavNode(Node):
             "bev.cleanup_min_obstacle_cells": 2,
             "bev.ego_clear_radius_m": 0.30,
             "bev.ego_clear_traversability": 0.80,
-            # Ready for A*/GDF: UNKNOWN stays traversable at a penalty;
+            # UNKNOWN stays traversable at a penalty;
             # hard/inflated cells are +inf and clearance raises local cost.
             "planning.unknown_cost": 3.0,
             "planning.nontraversable_cost": 6.0,
             "planning.clearance_target_m": 0.45,
             "planning.clearance_cost_weight": 4.0,
-            # GDF / SDF local planner: this planner samples no trajectories.
-            "gdf.unknown_cost": 2.0,
-            "gdf.obstacle_inflation_m": 0.20,
-            "gdf.goal_search_radius_m": 1.0,
-            "gdf.lookahead_m": 0.70,
-            "gdf.side_lock_s": 1.5,
-            "gdf.side_hysteresis_m": 0.15,
-            "gdf.avoid_heading_delta_deg": 12.0,
-            "gdf.avoid_turn_in_place_angle_deg": 75.0,
-            "gdf.avoid_min_linear": 0.08,
-            # Trigger-only avoidance: only this footprint-width rectangle
-            # decides whether GDF/SDF take over steering.
-            "gdf.corridor_lookahead_m": 1.20,
-            "gdf.corridor_half_width_m": 0.40,
-            "gdf.corridor_emergency_m": 0.30,
-            "gdf.avoid_exit_clear_frames": 6,
-            "sdf.clearance_target_m": 0.45,
-            "sdf.clearance_emergency_m": 0.18,
-            "sdf.clearance_gain": 1.25,
-            # recovery
-            "recovery.rotate_speed": 0.50,
-            "recovery.min_rotate": 0.25,
-            "recovery.side_lock_s": 2.00,
-            "recovery.scan_max_angle_deg": 80.0,
-            "recovery.scan_step_deg": 10.0,
-            "recovery.ray_length": 1.40,
-            "recovery.min_free_m": 0.45,
-            "recovery.goal_weight": 0.60,
-            "recovery.turn_weight": 0.12,
-            "recovery.backup_speed": 0.10,
+            # MPPI samples complete vx/vy/wz sequences over this horizon.
+            # max_vy=0 is deliberate for a differential-drive base; set it
+            # nonzero only for a robot/controller that accepts lateral twist.
+            "mppi.horizon_steps": 24,
+            "mppi.dt": 0.10,
+            "mppi.samples": 384,
+            "mppi.temperature": 1.0,
+            "mppi.noise_vx": 0.16,
+            "mppi.noise_vy": 0.08,
+            "mppi.noise_wz": 0.55,
+            "mppi.min_vx": -0.10,
+            "mppi.max_vx": 0.40,
+            "mppi.max_vy": 0.0,
+            "mppi.max_wz": 1.20,
+            "mppi.max_accel_vx": 0.60,
+            "mppi.max_accel_vy": 0.50,
+            "mppi.max_accel_wz": 1.80,
+            "mppi.start_relax_distance": 0.90,
+            "mppi.goal_weight": 5.0,
+            "mppi.terminal_goal_weight": 10.0,
+            "mppi.heading_weight": 0.8,
+            "mppi.costmap_weight": 1.0,
+            "mppi.control_weight": 0.08,
+            "mppi.smooth_weight": 0.35,
+            "mppi.seed": 7,
             # control/global
             "control.enabled": False,
             "control.max_angular": 1.2,
@@ -599,8 +593,10 @@ class Dinov3NavNode(Node):
             "output.save_every": 5,
             "process_period": 0.10,
             "debug.show_window": False,
-            "debug.window_name": "DINOv3 GDF/SDF BEV",
+            "debug.window_name": "DINOv3 MPPI BEV",
             "debug.window_scale": 1.0,
+            "debug.window_rate_hz": 20.0,
+            "debug.window_backend": "auto",
         }
         values = {}
         for name, default in defaults.items():
@@ -621,6 +617,16 @@ class Dinov3NavNode(Node):
             f"new goal ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}) "
             f"frame='{msg.header.frame_id or self._default_goal_frame}'"
         )
+
+    def _on_odom(self, msg: Odometry):
+        """Keep measured body-frame velocity as the MPPI rollout state.
+
+        REP-147 odometry twist is conventionally expressed in child_frame_id
+        (base_link).  If a source uses another convention it must publish a
+        proper odometry transform; this node does not silently reinterpret it.
+        """
+        tw = msg.twist.twist
+        self._odom_velocity = (float(tw.linear.x), float(tw.linear.y), float(tw.angular.z))
 
     def _on_images(self, rgb_msg: Image, depth_msg: Image):
         self._process(rgb_msg, depth_msg)
@@ -808,6 +814,115 @@ class Dinov3NavNode(Node):
         out[int((1.0 - self._bottom_exempt) * h):, :] = False
         return out
 
+    # ----------------------------- realtime MPPI debug window
+    def _set_debug_image(self, image_rgb: np.ndarray, status: str) -> None:
+        """Hand off the latest rendered BEV without blocking ROS callbacks."""
+        if not self._debug_window_active:
+            return
+        canvas = image_rgb.copy()
+        # Give the standalone window the same immediate observability as the
+        # status topic: selected control, valid samples and rejection reasons.
+        cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 44), (18, 18, 18), -1)
+        text = status[:180]
+        cv2.putText(canvas, text, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (245, 245, 245), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "X forward  ^    Y left  <    blue=rollouts  white=selected",
+                    (8, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 230, 255), 1,
+                    cv2.LINE_AA)
+        with self._debug_window_lock:
+            self._debug_window_image = canvas
+
+    def _debug_loop(self) -> None:
+        """Run a real-time window without ever blocking ROS callbacks."""
+        backend = self._debug_window_backend
+        if backend in ("auto", "opencv") and self._debug_loop_opencv():
+            return
+        if backend == "opencv":
+            self._disable_debug_window("OpenCV HighGUI is unavailable")
+            return
+        self._debug_loop_tk()
+
+    def _latest_debug_image(self) -> Optional[np.ndarray]:
+        with self._debug_window_lock:
+            return (None if self._debug_window_image is None
+                    else self._debug_window_image.copy())
+
+    def _disable_debug_window(self, reason: str) -> None:
+        self._debug_window_active = False
+        self._debug_window_running.clear()
+        self.get_logger().warning(
+            f"cannot create MPPI debug window ({reason}); keep ROS image topics enabled"
+        )
+
+    def _debug_loop_opencv(self) -> bool:
+        """Return false when this cv2 build lacks a HighGUI backend."""
+        delay_ms = max(1, int(round(1000.0 / self._debug_window_rate_hz)))
+        try:
+            cv2.namedWindow(self._debug_window_name, cv2.WINDOW_NORMAL)
+            while self._debug_window_running.is_set():
+                image = self._latest_debug_image()
+                if image is not None:
+                    if self._debug_window_scale != 1.0:
+                        image = cv2.resize(
+                            image, None, fx=self._debug_window_scale,
+                            fy=self._debug_window_scale, interpolation=cv2.INTER_NEAREST,
+                        )
+                    # renderers produce RGB for ROS; HighGUI expects BGR.
+                    cv2.imshow(self._debug_window_name, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                key = cv2.waitKey(delay_ms) & 0xFF
+                if key in (27, ord("q")):
+                    self._debug_window_running.clear()
+                    self._debug_window_active = False
+                    self.get_logger().info("MPPI debug window closed by user")
+            return True
+        except cv2.error as exc:
+            self.get_logger().info(f"OpenCV HighGUI unavailable, falling back to Tk: {exc}")
+            return False
+        finally:
+            try:
+                cv2.destroyWindow(self._debug_window_name)
+            except cv2.error:
+                pass
+
+    def _debug_loop_tk(self) -> None:
+        """Tk/Pillow fallback for headless OpenCV wheels in the DINO venv."""
+        try:
+            import tkinter as tk
+            from PIL import Image as PILImage
+            from PIL import ImageTk
+
+            root = tk.Tk()
+            root.title(self._debug_window_name)
+            label = tk.Label(root)
+            label.pack()
+
+            def close() -> None:
+                self._debug_window_running.clear()
+
+            root.protocol("WM_DELETE_WINDOW", close)
+            root.bind("<Escape>", lambda _event: close())
+            root.bind("q", lambda _event: close())
+            period = 1.0 / self._debug_window_rate_hz
+            while self._debug_window_running.is_set():
+                image = self._latest_debug_image()
+                if image is not None:
+                    pil = PILImage.fromarray(image, mode="RGB")
+                    if self._debug_window_scale != 1.0:
+                        width = max(1, round(pil.width * self._debug_window_scale))
+                        height = max(1, round(pil.height * self._debug_window_scale))
+                        pil = pil.resize((width, height), PILImage.Resampling.NEAREST)
+                    photo = ImageTk.PhotoImage(pil)
+                    label.configure(image=photo)
+                    label.image = photo  # retain the Tcl image reference
+                root.update_idletasks()
+                root.update()
+                time.sleep(period)
+            root.destroy()
+            self._debug_window_active = False
+            self.get_logger().info("MPPI debug window closed by user")
+        except Exception as exc:
+            self._disable_debug_window(f"Tk fallback failed: {exc}")
+
     # ----------------------------- processing
     def _process(self, rgb_msg: Image, depth_msg: Optional[Image]):
         now = time.monotonic()
@@ -870,7 +985,7 @@ class Dinov3NavNode(Node):
                 traversable = cv2.bitwise_or(traversable, sres.mask)
         except Exception as exc:
             self.get_logger().error(f"perception failed: {exc}", throttle_duration_sec=10.0)
-            self._cmd = (0.0, 0.0)
+            self._cmd = (0.0, 0.0, 0.0)
             return
 
         obstacle_pixels = None
@@ -880,25 +995,25 @@ class Dinov3NavNode(Node):
             goal_distance is not None and goal_distance <= self._goal_tolerance
         )
 
-        plan: Optional[GDFPlanResult] = None
+        plan: Optional[MPPIResult] = None
         bev_debug = None
         bev = None
         raw_bev = None
         planning: Optional[PlanningBEV] = None
         near_obstacle = self._depth_obstacle(depth, rgb.shape[:2])
         if self._goal_reached:
-            self._cmd = (0.0, 0.0)
+            self._cmd = (0.0, 0.0, 0.0)
         elif depth is None:
-            self._cmd = (0.0, 0.0)
+            self._cmd = (0.0, 0.0, 0.0)
             self.get_logger().warning("BEV planner requires depth", throttle_duration_sec=5.0)
         else:
             K = self._camera_matrix(depth.shape)
             T = self._camera_to_planner()
             if K is None:
-                self._cmd = (0.0, 0.0)
+                self._cmd = (0.0, 0.0, 0.0)
                 self.get_logger().warning("waiting for valid CameraInfo", throttle_duration_sec=5.0)
             elif T is None:
-                self._cmd = (0.0, 0.0)
+                self._cmd = (0.0, 0.0, 0.0)
             else:
                 if self._sanity_ok is None:
                     self._sanity_ok = self._projection_sanity(K, T)
@@ -914,14 +1029,14 @@ class Dinov3NavNode(Node):
                     bev = self._fuse_raw_bev(raw_bev)
                     observed_fraction = float(bev.observed.mean())
                     if observed_fraction < self._min_observed_fraction:
-                        self._cmd = (0.0, 0.0)
+                        self._cmd = (0.0, 0.0, 0.0)
                         self.get_logger().warning(
                             f"BEV observed only {observed_fraction:.1%} of cells; "
                             "stopping (depth/CameraInfo problem?)",
                             throttle_duration_sec=5.0,
                         )
                     elif not self._sanity_ok:
-                        self._cmd = (0.0, 0.0)
+                        self._cmd = (0.0, 0.0, 0.0)
                     else:
                         planning = build_planning_bev(
                             bev, self._foot_cfg, self._planning_cost_cfg
@@ -930,22 +1045,22 @@ class Dinov3NavNode(Node):
                             # Map production is intentionally independent of
                             # navigation authority. This lets raw/planning BEV
                             # be inspected before a global goal is issued.
-                            self._cmd = (0.0, 0.0)
+                            self._cmd = (0.0, 0.0, 0.0)
                         else:
-                            plan = self._planner.plan(
-                                planning.grid, planning.layers, local_goal, now=time.monotonic()
-                            )
+                            checker = FootprintChecker(planning.grid, self._foot_cfg, planning.layers)
+                            plan = self._planner.plan(planning, checker, local_goal, self._odom_velocity)
                             self._cmd = plan.command
                         if (self._bev_debug_pub is not None or self._out_dir is not None
                                 or self._debug_window_active):
-                            bev_debug = render_gdf_debug(
-                                planning.grid, planning.layers, plan, local_goal, scale=5
+                            bev_debug = render_bev_debug(
+                                planning.grid, planning.layers, plan, local_goal, scale=5,
+                                footprint=(self._foot_cfg.length, self._foot_cfg.width)
                             )
                 except Exception as exc:
                     self.get_logger().error(
                         f"BEV/planner failed: {exc}", throttle_duration_sec=5.0
                     )
-                    self._cmd = (0.0, 0.0)
+                    self._cmd = (0.0, 0.0, 0.0)
 
         self._last_plan = plan
         self._last_result = time.monotonic()
@@ -967,6 +1082,8 @@ class Dinov3NavNode(Node):
 
         status = self._status_text(plan, local_goal, goal_distance)
         self._status_pub.publish(String(data=status))
+        if bev_debug is not None:
+            self._set_debug_image(bev_debug, status)
         if plan is not None and plan.mode != self._last_mode:
             self.get_logger().info(f"planner mode: {self._last_mode or '-'} -> {plan.mode}")
             self._last_mode = plan.mode
@@ -1054,7 +1171,7 @@ class Dinov3NavNode(Node):
 
     def _status_text(
         self,
-        plan: Optional[GDFPlanResult],
+        plan: Optional[MPPIResult],
         local_goal: Optional[Tuple[float, float]],
         goal_distance: Optional[float],
     ) -> str:
@@ -1064,20 +1181,12 @@ class Dinov3NavNode(Node):
         if local_goal is not None:
             goal_txt = f"goal(base)=({local_goal[0]:.2f},{local_goal[1]:.2f})"
         if plan is None:
-            return f"WAITING {goal_txt} cmd=({self._cmd[0]:.2f},{self._cmd[1]:+.2f})"
-        sel_v, sel_w = plan.command
-        desired_txt = (f"{np.degrees(plan.desired_heading):+.1f}deg"
-                       if plan.desired_heading is not None else "--")
-        gdf_txt = (f"{np.degrees(plan.gdf_heading):+.1f}deg"
-                   if plan.gdf_heading is not None else "--")
+            return f"WAITING {goal_txt} cmd=({self._cmd[0]:.2f},{self._cmd[1]:+.2f},{self._cmd[2]:+.2f})"
+        vx, vy, wz = plan.command
         return (
-            f"{plan.mode} {goal_txt} "
-            f"heading={desired_txt} gdf={gdf_txt} "
-            f"corridor={'BLOCKED' if plan.corridor_blocked else 'CLEAR'} "
-            f"goal_lane={'CLEAR' if plan.goal_corridor_clear else 'BLOCKED'} "
-            f"exit={plan.exit_clear_frames} clear={plan.clearance_m:.2f}m side={plan.side:+d} "
-            f"sel=({sel_v:.2f},{sel_w:+.2f}) "
-            f"cmd=({self._cmd[0]:.2f},{self._cmd[1]:+.2f})"
+            f"{plan.mode} {goal_txt} valid={plan.effective_samples}/{len(plan.candidates)} "
+            f"cost={plan.best_cost:.2f} reject={plan.diagnostics} sel=({vx:.2f},{vy:+.2f},{wz:+.2f}) "
+            f"cmd=({self._cmd[0]:.2f},{self._cmd[1]:+.2f},{self._cmd[2]:+.2f})"
         )
 
     def _draw_overlay(
@@ -1085,7 +1194,7 @@ class Dinov3NavNode(Node):
         rgb: np.ndarray,
         traversable: np.ndarray,
         obstacle: np.ndarray,
-        plan: Optional[GDFPlanResult],
+        plan: Optional[MPPIResult],
         local_goal: Optional[Tuple[float, float]],
     ) -> np.ndarray:
         out = rgb.copy()
@@ -1106,16 +1215,20 @@ class Dinov3NavNode(Node):
         if self._cmd_pub is None:
             return
         stale = self._last_result is None or (time.monotonic() - self._last_result) > self._watchdog
-        lin, ang = (0.0, 0.0) if stale or self._goal_reached else self._cmd
+        vx, vy, wz = (0.0, 0.0, 0.0) if stale or self._goal_reached else self._cmd
         if self._sanity_ok is not True:
-            lin, ang = 0.0, 0.0
+            vx, vy, wz = 0.0, 0.0, 0.0
         msg = Twist()
-        msg.linear.x = float(lin)
-        msg.angular.z = float(ang)
+        msg.linear.x = float(vx)
+        msg.linear.y = float(vy)
+        msg.angular.z = float(wz)
         self._cmd_pub.publish(msg)
 
     def stop(self):
-        self._cmd = (0.0, 0.0)
+        self._debug_window_running.clear()
+        if self._debug_window_thread is not None and self._debug_window_thread.is_alive():
+            self._debug_window_thread.join(timeout=1.0)
+        self._cmd = (0.0, 0.0, 0.0)
         if self._cmd_pub is not None:
             msg = Twist()
             self._cmd_pub.publish(msg)

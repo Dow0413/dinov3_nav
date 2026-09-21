@@ -102,8 +102,12 @@ def render_bev_debug(
                           (rx + half_w, ry + half_l), (255, 170, 30), 1, cv2.LINE_AA)
 
         cv2.circle(canvas, (rx, ry), max(3, scale), (70, 180, 255), -1)
-        # heading tick
-        cv2.line(canvas, (rx, ry), (rx, ry - 3 * scale), (70, 180, 255), 1, cv2.LINE_AA)
+        # Robot-centric coordinate axes: +X (forward) is red, +Y (left) green.
+        axis = max(4 * scale, int(0.45 / bev.cfg.resolution * scale))
+        cv2.arrowedLine(canvas, (rx, ry), (rx, ry - axis), (255, 60, 60), 2,
+                        cv2.LINE_AA, tipLength=0.18)
+        cv2.arrowedLine(canvas, (rx, ry), (rx - axis, ry), (60, 255, 60), 2,
+                        cv2.LINE_AA, tipLength=0.18)
 
         if goal_xy is not None:
             gx, gy = goal_xy

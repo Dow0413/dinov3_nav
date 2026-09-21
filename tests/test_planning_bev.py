@@ -9,7 +9,12 @@ import cv2
 import numpy as np
 
 from dinov3_nav.bev import BEVConfig, BEVGrid
-from dinov3_nav.debug_viz import render_planning_bev, render_planning_layer, render_raw_bev
+from dinov3_nav.debug_viz import (
+    render_bev_debug,
+    render_planning_bev,
+    render_planning_layer,
+    render_raw_bev,
+)
 from dinov3_nav.footprint import FootprintConfig
 from dinov3_nav.planning_bev import (
     PlanningCostConfig,
@@ -88,6 +93,14 @@ def test_inflation_clearance_and_cost():
     assert planning.inflated_obstacle[near] and np.isinf(planning.planning_cost[near])
     assert planning.clearance_m[far] > planning.clearance_m[near]
     print("inflation + clearance cost: OK")
+
+
+def test_debug_bev_renders_before_a_goal_exists():
+    """Perception/debug must be usable while navigation authority is idle."""
+    stable = fusion().update(raw_grid([(1.0, 0.0)]), 0.0, None)
+    planning = build_planning_bev(stable, FootprintConfig(), PlanningCostConfig())
+    image = render_bev_debug(planning.grid, planning.layers, None, None, scale=2)
+    assert image.ndim == 3 and image.shape[2] == 3 and image.size > 0
 
 
 def save_debug_outputs(output_dir: Path):

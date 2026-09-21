@@ -4,7 +4,7 @@ package_name = "dinov3_nav"
 
 setup(
     name=package_name,
-    version="0.3.0",
+    version="0.4.0",
     packages=[package_name],
     # Keep the project venv shebang of scripts/dinov3_nav_node unchanged.
     data_files=[
@@ -16,6 +16,6 @@ setup(
     ],
     maintainer="dow",
     maintainer_email="dow@todo.todo",
-    description="DINOv3 RGB-D capability-inspired traversability navigation with footprint-aware local planning.",
+    description="DINOv3 RGB-D traversability navigation with a footprint-safe MPPI local planner.",
     license="MIT",
 )

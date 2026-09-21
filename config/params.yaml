@@ -9,6 +9,7 @@ dinov3_nav:
     camera_info_topic: /zed/zed_node/rgb/camera_info
     cmd_vel_topic: /cmd_vel
     goal_pose_topic: /goal_pose
+    odom_topic: /odom
 
     ground_mask_topic: /dinov3_nav/ground_mask
     traversable_mask_topic: /dinov3_nav/traversable_mask
@@ -140,44 +141,43 @@ dinov3_nav:
 
     # ================= Planning costmap =================
     # Hard / inflated obstacles are forbidden. Unknown remains available at a
-    # high cost; clearance raises cost near obstacles so future A*/GDF chooses
+    # high cost; clearance raises cost near obstacles so MPPI prefers
     # open corridor centres rather than grazing obstacle edges.
     planning.unknown_cost: 3.0
     planning.nontraversable_cost: 6.0
     planning.clearance_target_m: 0.45
     planning.clearance_cost_weight: 4.0
 
-    # ================= GDF + SDF local planner =================
-    # GDF is Dijkstra cost-to-go through free cells. Unknown is allowed with
-    # a penalty instead of being converted into an obstacle.
-    gdf.unknown_cost: 2.0
-    gdf.obstacle_inflation_m: 0.20 # m, hard obstacle dilation for this GDF stage
-    gdf.goal_search_radius_m: 1.0
-    gdf.lookahead_m: 0.70
-    # A footprint-width forward corridor triggers local avoidance.  It is
-    # deliberately independent of GDF: when this corridor is clear, the
-    # controller tracks the global goal directly.
-    gdf.corridor_lookahead_m: 1.20
-    gdf.corridor_half_width_m: 0.40 # robot half-width + lateral margin
-    gdf.corridor_emergency_m: 0.30
-    # Consecutive frames for which both the forward and global-goal corridors
-    # must be clear before an AVOID state returns to GO_TO_GOAL.
-    gdf.avoid_exit_clear_frames: 6
-    # Retained as a soft local descent preference; the state machine makes
-    # the actual left/right commitment persistent across frames.
-    gdf.side_lock_s: 1.5
-    gdf.side_hysteresis_m: 0.15
-    gdf.avoid_heading_delta_deg: 12.0
-    # A GDF detour is already checked in the inflated free map. Let the
-    # quadruped move on a slow arc for ordinary detour angles; reserve pure
-    # rotation for near-reverse headings or emergency obstacle proximity.
-    gdf.avoid_turn_in_place_angle_deg: 75.0
-    gdf.avoid_min_linear: 0.08
-    # SDF is clearance only. It corrects the GDF heading near obstacles but
-    # never chooses the main left/right route.
-    sdf.clearance_target_m: 0.45
-    sdf.clearance_emergency_m: 0.18
-    sdf.clearance_gain: 1.25
+    # ================= MPPI local planner =================
+    # Each update samples and rolls out full (vx, vy, wz) control sequences
+    # through the inflated robot-centric costmap. It never chooses a steering
+    # direction directly from the current image mask.
+    mppi.horizon_steps: 24
+    mppi.dt: 0.10
+    mppi.samples: 384
+    mppi.temperature: 1.0
+    mppi.noise_vx: 0.16
+    mppi.noise_vy: 0.08
+    mppi.noise_wz: 0.55
+    mppi.min_vx: -0.10
+    mppi.max_vx: 0.40
+    # Differential-drive default. Set nonzero only if the downstream base
+    # controller genuinely supports Twist.linear.y.
+    mppi.max_vy: 0.0
+    mppi.max_wz: 1.20
+    mppi.max_accel_vx: 4.00
+    mppi.max_accel_vy: 0.50
+    mppi.max_accel_wz: 6.00
+    # Unknown support inside this forward near-field is expected due to the
+    # camera blind zone. Collision with inflated obstacles remains forbidden.
+    mppi.start_relax_distance: 0.90
+    mppi.goal_weight: 5.0
+    mppi.terminal_goal_weight: 10.0
+    mppi.heading_weight: 0.8
+    mppi.costmap_weight: 1.0
+    mppi.control_weight: 0.08
+    mppi.smooth_weight: 0.35
+    mppi.seed: 7
 
     # ================= Control / global target =================
     # SAFETY: control stays off until TF + CameraInfo + projection sanity
@@ -200,11 +200,15 @@ dinov3_nav:
     output.dir: ""
     output.save_every: 5
 
-    # ================= Live GDF/SDF debug =================
-    # Requires a graphical display in the launch environment. It shows BEV,
-    # GDF heat map, obstacle inflation, goal (yellow), GDF path (cyan), and
-    # final SDF-corrected heading (magenta).
-    # Images are saved/published with OpenCV only; no HighGUI/Qt popup.
+    # ================= MPPI debug =================
+    # The launch file starts ROS image_view (C++ system OpenCV) by default to
+    # show this BEV. Keep this Python/Tk fallback off unless launch is not
+    # used. ROS topics and PNG output remain available regardless.
     debug.show_window: false
-    debug.window_name: DINOv3_GDF_SDF_BEV
+    debug.window_name: DINOv3_MPPI_BEV
     debug.window_scale: 1.0
+    debug.window_rate_hz: 20.0
+    # This project venv uses an OpenCV wheel without HighGUI. Tk/Pillow shows
+    # the same RGB BEV window without needing to rebuild OpenCV. "auto" tries
+    # OpenCV then Tk; "opencv" forces HighGUI when a GUI-enabled cv2 is used.
+    debug.window_backend: tk
